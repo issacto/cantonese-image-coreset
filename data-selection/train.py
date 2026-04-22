@@ -129,7 +129,7 @@ def parse_args() -> argparse.Namespace:
     comp = p.add_argument_group("Compute")
     comp.add_argument("--workers", type=int, default=4)
     comp.add_argument(
-        "--gpus", type=float, default=1.0,
+        "--gpus", type=int, default=1.0,
         help="Total GPUs declared to Ray (e.g. 2.0 for two physical GPUs).",
     )
     comp.add_argument(
@@ -165,11 +165,11 @@ def validate_args(args: argparse.Namespace) -> None:
             "--local-coreset-size should be >= --embed-batch-size."
         )
     max_workers = math.floor(args.gpus / args.gpu_per_worker)
-    if args.workers > max_workers:
-        errors.append(
-            f"--workers ({args.workers}) exceeds GPU capacity "
-            f"floor({args.gpus}/{args.gpu_per_worker})={max_workers}."
-        )
+    # if args.workers > max_workers:
+    #     errors.append(
+    #         f"--workers ({args.workers}) exceeds GPU capacity "
+    #         f"floor({args.gpus}/{args.gpu_per_worker})={max_workers}."
+    #     )
     if args.shuffle_buffer < args.batch_size:
         print(
             f"[Warning] --shuffle-buffer ({args.shuffle_buffer}) < --batch-size "
@@ -198,25 +198,52 @@ def run_work_stealing(workers: list, dispatcher, progress_every: int) -> None:
     t0 = time.time()
 
     def _dispatch_to(worker):
-      result = ray.get(dispatcher.get_batch.remote())
+        # NOTE: get_batch is called synchronously here which is fine —
+        # the dispatcher is a Ray actor so this is a remote call, not a
+        # local block.  Use a generous timeout; HF streaming can be slow.
+        try:
+            result = ray.get(dispatcher.get_batch.remote(), timeout=30)
+        except ray.exceptions.GetTimeoutError:
+            print("[Dispatcher] timed out — treating as exhausted")
+            return False
 
-      if result is None:
-          return False
+        if result is None:
+            return False
 
-      future = worker.process_batch.remote(result["images"], result["ids"])
-      pending[future] = worker
-      return True
+        future = worker.process_batch.remote(result["images"], result["ids"])
+        pending[future] = worker
+        return True
 
     # Seed all workers
     for w in workers:
         _dispatch_to(w)
 
     while pending:
-        done_list, _ = ray.wait(list(pending.keys()), num_returns=1)
+        print("completed ", completed, "pending ",pending)
+
+        # ── Wait for any one worker to finish ─────────────────────────────
+        # timeout=None here is intentional: we already have max_concurrency=4
+        # on CoresetWorker and the embed call properly yields the event loop,
+        # so a worker *will* eventually finish.  A finite timeout would cause
+        # the "stuck at 199" symptom when the last batch takes slightly longer
+        # (e.g. smaller batch, GPU still warm from previous call).
+        done_list, _ = ray.wait(list(pending.keys()), num_returns=1, timeout=None)
+
         done_ref = done_list[0]
         worker = pending.pop(done_ref)
 
-        ray.get(done_ref)   # surface any worker-side exceptions
+        # ── Surface worker-side exceptions without killing the loop ───────
+        # Previously: ray.get(done_ref) would raise and exit the function,
+        # leaving remaining futures in `pending` permanently — the "stuck at
+        # 199" case when the last worker's process_batch raised an error.
+        try:
+            ray.get(done_ref)
+        except Exception as exc:
+            print(f"[Worker] process_batch raised: {exc!r} — continuing")
+            # Worker is still alive; re-dispatch to it so it isn't lost
+            _dispatch_to(worker)
+            continue
+
         completed += 1
 
         if completed % progress_every == 0:
@@ -235,9 +262,9 @@ def run_work_stealing(workers: list, dispatcher, progress_every: int) -> None:
                 f"ETA {eta:.0f}s"
             )
 
+        # Re-dispatch this worker; if exhausted it simply won't be added
+        # back to `pending` and will drop out of the loop naturally.
         _dispatch_to(worker)
-
-
 # ── Global merge ──────────────────────────────────────────────────────────────
 
 def global_merge(workers: list, final_coreset_size: int) -> tuple:
@@ -294,8 +321,10 @@ def main() -> None:
     print("=" * 64)
 
     # ── Ray init ──────────────────────────────────────────────────────────────
-    ray.init(num_cpus=args.workers * args.cpus_per_worker, num_gpus=args.gpus)
+    ray.init(num_cpus=6, num_gpus=args.gpus)
     print(f"[Ray] Cluster resources: {ray.cluster_resources()}")
+    args.total_samples = (args.total_samples // args.batch_size) * args.batch_size
+    print(f"[Info] Rounded total_samples to {args.total_samples} (multiple of batch_size)")
 
     # ── HF kwargs ─────────────────────────────────────────────────────────────
     hf_kwargs = {}
@@ -303,6 +332,19 @@ def main() -> None:
         hf_kwargs["name"] = args.hf_name
     if args.hf_token:
         hf_kwargs["token"] = args.hf_token
+
+    # EMBED
+    MODEL = "openai/clip-vit-base-patch32"
+    EMBED_BATCH = 128
+
+    from coreset.ClipWorker import ClipWorker
+
+    embedders = [
+        ClipWorker.options(num_gpus=1.0).remote(MODEL, EMBED_BATCH)
+        for _ in range(args.gpus)   # 2 embedders → 2 GPUs fully utilised
+    ]
+
+
 
     # ── Step 1: Dispatcher (owns the HF stream) ───────────────────────────────
     print(f"\n[1/3] Launching dispatcher ...")
@@ -327,18 +369,16 @@ def main() -> None:
 
     # ── Step 2: Spawn workers ─────────────────────────────────────────────────
     print(f"\n[2/3] Spawning {args.workers} workers ...")
-    from coreset.worker import CorsetWorker
+    from coreset.CoresetWorker import CoresetWorker
 
-    WorkerCls = CorsetWorker.options(
-        num_cpus=args.cpus_per_worker,
-        num_gpus=args.gpu_per_worker,
+    WorkerCls = CoresetWorker.options(
+        num_cpus=args.cpus_per_worker
     )
     workers = [
         WorkerCls.remote(
             worker_id=i,
-            model_name=args.model,
             coreset_size=args.local_coreset_size,
-            embed_batch_size=args.embed_batch_size,
+            embedder=embedders[i % len(embedders)],
         )
         for i in range(args.workers)
     ]

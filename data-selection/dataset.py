@@ -127,7 +127,8 @@ class HFStreamingDataset:
                 with urllib.request.urlopen(raw, timeout=10) as resp:
                     return Image.open(io.BytesIO(resp.read())).convert("RGB")
 
-        except Exception:
+        except Exception as e:
+            print(f"[decode] failed: {type(raw)} {e}")
             return None
 
         return None
@@ -161,14 +162,24 @@ class HFStreamingDataset:
                 break
 
             raw_list = example.get(self.image_col)
+            # print(f"[DEBUG] raw_list type={type(raw_list)}, value={str(raw_list)[:200]}")
 
             if not raw_list or len(raw_list) == 0:
                 images.append(None)
+                ids.append(start_id + local_i)  # ← always append id
                 continue
 
             raw = raw_list[0] if isinstance(raw_list, list) else raw_list
-            images.append(self._decode_image(raw))
-            ids.append(start_id + local_i)
+            img = self._decode_image(raw)
+
+            if img is not None:
+                import io
+                buf = io.BytesIO()
+                img.save(buf, format="PNG")
+                images.append(buf.getvalue())
+            else:
+                images.append(None)
+            ids.append(start_id + local_i) 
 
         self._cursor = start_id + len(images)
         return images, ids
