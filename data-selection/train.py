@@ -15,8 +15,7 @@ Usage example:
         --embed-batch-size 16 \
         --workers 4 \
         --gpus 2 \
-        --gpu-per-worker 0.5 \
-        --model openai/clip-vit-base-patch32 \
+                            --model openai/clip-vit-base-patch32 \
         --output ./coreset_output \
         --seed 42
 
@@ -66,6 +65,10 @@ def parse_args() -> argparse.Namespace:
     data.add_argument(
         "--hf-dataset", type=str, required=True,
         help="HuggingFace dataset repo id, e.g. 'laion/laion2B-en'.",
+    )
+    data.add_argument(
+        "--total-cpus", type=int, required=True,
+        help="Total Cpus",
     )
     data.add_argument(
         "--hf-split", type=str, default="train",
@@ -132,10 +135,6 @@ def parse_args() -> argparse.Namespace:
         "--gpus", type=int, default=1.0,
         help="Total GPUs declared to Ray (e.g. 2.0 for two physical GPUs).",
     )
-    comp.add_argument(
-        "--gpu-per-worker", type=float, default=0.5,
-        help="Fractional GPU per worker.  Two workers at 0.5 share one GPU.",
-    )
     comp.add_argument("--cpus-per-worker", type=int, default=1)
 
     # ── Output ────────────────────────────────────────────────────────────────
@@ -164,7 +163,7 @@ def validate_args(args: argparse.Namespace) -> None:
         errors.append(
             "--local-coreset-size should be >= --embed-batch-size."
         )
-    max_workers = math.floor(args.gpus / args.gpu_per_worker)
+    # max_workers = math.floor(args.gpus / args.gpu_per_worker)
     # if args.workers > max_workers:
     #     errors.append(
     #         f"--workers ({args.workers}) exceeds GPU capacity "
@@ -202,7 +201,7 @@ def run_work_stealing(workers: list, dispatcher, progress_every: int) -> None:
         # the dispatcher is a Ray actor so this is a remote call, not a
         # local block.  Use a generous timeout; HF streaming can be slow.
         try:
-            result = ray.get(dispatcher.get_batch.remote(), timeout=30)
+            result = ray.get(dispatcher.get_batch.remote(), timeout=None)
         except ray.exceptions.GetTimeoutError:
             print("[Dispatcher] timed out — treating as exhausted")
             return False
@@ -314,14 +313,13 @@ def main() -> None:
     print(f"  Local coreset   : {args.local_coreset_size:,}  (per worker)")
     print(f"  Batch size      : {args.batch_size:,}  (images per round)")
     print(f"  Embed batch     : {args.embed_batch_size}  (images per CLIP call)")
-    print(f"  Workers         : {args.workers}  x  {args.gpu_per_worker} GPU")
     print(f"  Model           : {args.model}")
     print(f"  Output          : {args.output}")
     print(f"  Seed            : {args.seed}")
     print("=" * 64)
 
     # ── Ray init ──────────────────────────────────────────────────────────────
-    ray.init(num_cpus=6, num_gpus=args.gpus)
+    ray.init(num_cpus=args.total_cpus, num_gpus=args.gpus)
     print(f"[Ray] Cluster resources: {ray.cluster_resources()}")
     args.total_samples = (args.total_samples // args.batch_size) * args.batch_size
     print(f"[Info] Rounded total_samples to {args.total_samples} (multiple of batch_size)")
