@@ -48,6 +48,11 @@ import time
 from pathlib import Path
 from typing import List, Optional
 
+from coreset.CoresetWorker import CoresetWorker
+from coreset.ClipWorker import ClipWorker
+from ray.util.placement_group import placement_group
+from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
+
 import numpy as np
 import ray
 
@@ -335,12 +340,6 @@ def main() -> None:
     MODEL = "openai/clip-vit-base-patch32"
     EMBED_BATCH = 128
 
-    from coreset.ClipWorker import ClipWorker
-
-    embedders = [
-        ClipWorker.options(num_gpus=1.0).remote(MODEL, EMBED_BATCH)
-        for _ in range(args.gpus)   # 2 embedders → 2 GPUs fully utilised
-    ]
 
 
 
@@ -348,7 +347,7 @@ def main() -> None:
     print(f"\n[1/3] Launching dispatcher ...")
     from coreset.dispatcher import WorkDispatcher
 
-    dispatcher = WorkDispatcher.remote(
+    dispatcher = WorkDispatcher.options(num_cpus=3).remote(
         dataset_name=args.hf_dataset,
         split=args.hf_split,
         image_col=args.hf_image_col,
@@ -365,21 +364,35 @@ def main() -> None:
     )
     print(f"      ~{total_batches} batches of {args.batch_size} images each.")
 
-    # ── Step 2: Spawn workers ─────────────────────────────────────────────────
+   # ── Step 2: Spawn workers ─────────────────────────────────────────────────
     print(f"\n[2/3] Spawning {args.workers} workers ...")
-    from coreset.CoresetWorker import CoresetWorker
 
-    WorkerCls = CoresetWorker.options(
-        num_cpus=args.cpus_per_worker
-    )
-    workers = [
-        WorkerCls.remote(
-            worker_id=i,
-            coreset_size=args.local_coreset_size,
-            embedder=embedders[i % len(embedders)],
+    workers_per_gpu = args.workers // args.gpus
+    embedders = []
+    workers = []
+
+    for i in range(args.gpus):
+        pg = placement_group(
+            bundles=[{"GPU": 1, "CPU": 1}] + [{"CPU": args.cpus_per_worker} for _ in range(workers_per_gpu)],
+            strategy="STRICT_PACK",
         )
-        for i in range(args.workers)
-    ]
+        ray.get(pg.ready())
+
+        embedder = ClipWorker.options(
+            num_gpus=1.0,
+            scheduling_strategy=PlacementGroupSchedulingStrategy(pg, placement_group_bundle_index=0),
+        ).remote(MODEL, EMBED_BATCH)
+        embedders.append(embedder)
+
+        for j in range(workers_per_gpu):
+            workers.append(CoresetWorker.options(
+                num_cpus=args.cpus_per_worker,
+                scheduling_strategy=PlacementGroupSchedulingStrategy(pg, placement_group_bundle_index=j + 1),
+            ).remote(
+                worker_id=i * workers_per_gpu + j,
+                coreset_size=args.local_coreset_size,
+                embedder=embedder,
+            ))
 
     # ── Step 3: Work-stealing loop ────────────────────────────────────────────
     print(f"\n[3/3] Processing batches (work-stealing) ...\n")
