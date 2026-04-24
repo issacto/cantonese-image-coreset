@@ -1,25 +1,34 @@
 %%writefile CoresetWorker.py
 
-import asyncio
+import io
 import numpy as np
 import ray
-from typing import Optional, Tuple
+import torch
+from PIL import Image
+from typing import List, Optional, Tuple
 
 
-@ray.remote(num_cpus=1, max_concurrency=4)   # ← raised from 1: prevents deadlock when
-                                              #   awaiting embedder while event loop is
-                                              #   occupied on the last batch
+@ray.remote
 class CoresetWorker:
     def __init__(
         self,
         worker_id: int,
         coreset_size: int,
-        embedder: ray.actor.ActorHandle,   # ← injected at construction
+        model_name: str,
+        embed_batch_size: int,
     ):
         self.worker_id = worker_id
         self.coreset_size = coreset_size
-        self.embedder = embedder           # shared CLIPEmbedder handle
+        self.embed_batch_size = embed_batch_size
 
+        # ── CLIP model (owned by this worker, lives on its 0.5-GPU slice) ─────
+        self.device = torch.device("cuda")
+        from transformers import CLIPModel, CLIPProcessor
+        self.processor = CLIPProcessor.from_pretrained(model_name)
+        self.model = CLIPModel.from_pretrained(model_name).to(self.device)
+        self.model.eval()
+
+        # ── Coreset state ──────────────────────────────────────────────────────
         self.coreset_embeddings: Optional[np.ndarray] = None
         self.coreset_indices: Optional[np.ndarray] = None
         self.batches_processed = 0
@@ -28,20 +37,81 @@ class CoresetWorker:
     def _log(self, msg: str) -> None:
         print(f"[Worker {self.worker_id}] {msg}")
 
-    def process_batch(self, images, ids) -> dict:
+    # ── Embedding (runs inline, no remote hop needed) ─────────────────────────
+
+    @torch.no_grad()
+    def _embed(
+        self,
+        images: List[Optional[bytes]],
+    ) -> Tuple[np.ndarray, List[int]]:
+        """Convert raw bytes → L2-normalised CLIP embeddings.
+
+        Returns
+        -------
+        embs        : float32 ndarray of shape (N_valid, D)
+        valid_pos   : list of original positions that survived
+        """
+        pil_images: List[Optional[Image.Image]] = []
+        for b in images:
+            if b is None:
+                pil_images.append(None)
+            else:
+                try:
+                    pil_images.append(Image.open(io.BytesIO(b)).convert("RGB"))
+                except Exception as exc:
+                    self._log(f"decode error, skipping: {exc}")
+                    pil_images.append(None)
+
+        indexed = [(i, img) for i, img in enumerate(pil_images) if img is not None]
+        if not indexed:
+            return np.empty((0, 0), dtype=np.float32), []
+
+        positions = [pos for pos, _ in indexed]
+        valid_imgs = [img for _, img in indexed]
+
+        all_embs: List[np.ndarray] = []
+        valid_positions_out: List[int] = []
+
+        for start in range(0, len(valid_imgs), self.embed_batch_size):
+            mini_imgs = valid_imgs[start : start + self.embed_batch_size]
+            mini_pos  = positions[start : start + self.embed_batch_size]
+            try:
+                inputs = self.processor(images=mini_imgs, return_tensors="pt", padding=True)
+                inputs = {k: v.to(self.device) for k, v in inputs.items()}
+                out = self.model.vision_model(pixel_values=inputs["pixel_values"])
+                feats = self.model.visual_projection(out.pooler_output)
+                feats = feats / feats.norm(dim=-1, keepdim=True)
+                all_embs.append(feats.cpu().float().numpy())
+                valid_positions_out.extend(mini_pos)
+            except Exception as exc:
+                self._log(f"mini-batch failed ({exc}), retrying one-by-one")
+                for img, pos in zip(mini_imgs, mini_pos):
+                    try:
+                        inputs = self.processor(images=[img], return_tensors="pt", padding=True)
+                        inputs = {k: v.to(self.device) for k, v in inputs.items()}
+                        out = self.model.vision_model(pixel_values=inputs["pixel_values"])
+                        feat = self.model.visual_projection(out.pooler_output)
+                        feat = feat / feat.norm(dim=-1, keepdim=True)
+                        all_embs.append(feat.cpu().float().numpy())
+                        valid_positions_out.append(pos)
+                    except Exception as inner_exc:
+                        self._log(f"skipping image at pos {pos}: {inner_exc}")
+
+        if not all_embs:
+            return np.empty((0, 0), dtype=np.float32), []
+
+        return np.concatenate(all_embs, axis=0), valid_positions_out
+
+    # ── Main entry point ──────────────────────────────────────────────────────
+
+    def process_batch(self, images: List[Optional[bytes]], ids: List[int]) -> dict:
         from coreset.greedy import incremental_coreset_merge
 
         skipped = sum(1 for img in images if img is None)
         self.images_skipped += skipped
 
-        # ── GPU work: dispatched to the embedder actor, non-blocking ─────────
-        # Wrap in asyncio.ensure_future so the ObjectRef is awaited as a proper
-        # asyncio-compatible future, yielding the event loop slot while waiting.
-        # This is what prevented the last batch from ever completing when the
-        # embedder was still busy and max_concurrency=1 (the default).
-        embed_ref = self.embedder.embed.remote(images)
-        self._log(f"embed dispatched, awaiting...")
-        new_embs, valid_pos = ray.get(embed_ref)
+        self._log(f"embedding {len(images)} images ...")
+        new_embs, valid_pos = self._embed(images)
         self._log(f"embed done, got {len(new_embs)} embeddings")
 
         if len(new_embs) == 0:
@@ -50,7 +120,7 @@ class CoresetWorker:
 
         valid_ids = np.array([ids[p] for p in valid_pos], dtype=np.int64)
 
-        # ── CPU work: merge + greedy k-center (stays on this actor) ──────────
+        # ── CPU work: greedy k-center coreset merge ───────────────────────────
         self.coreset_embeddings, self.coreset_indices = incremental_coreset_merge(
             existing_embeddings=self.coreset_embeddings,
             new_embeddings=new_embs,
@@ -75,6 +145,8 @@ class CoresetWorker:
         return {
             "worker_id": self.worker_id,
             "batches_processed": self.batches_processed,
-            "coreset_size": len(self.coreset_embeddings) if self.coreset_embeddings is not None else 0,
+            "coreset_size": (
+                len(self.coreset_embeddings) if self.coreset_embeddings is not None else 0
+            ),
             "images_skipped": self.images_skipped,
         }

@@ -1,4 +1,3 @@
-%%writefile train.py
 """
 train.py — Distributed Greedy Coreset Selection (HuggingFace streaming edition)
 
@@ -12,10 +11,9 @@ Usage example:
         --final-coreset-size 10000 \
         --local-coreset-size 1000 \
         --batch-size 256 \
-        --embed-batch-size 16 \
+        --embed-batch-size 128 \
         --workers 4 \
-        --gpus 2 \
-                            --model openai/clip-vit-base-patch32 \
+        --model openai/clip-vit-base-patch32 \
         --output ./coreset_output \
         --seed 42
 
@@ -30,11 +28,11 @@ Architecture recap
                                       │  (images_ref, ids_ref)
                     ┌─────────────────┼────────────────────┐
                     ▼                 ▼                     ▼
-             CorsetWorker 0   CorsetWorker 1  …  CorsetWorker N
-             (0.5 GPU each)   (0.5 GPU each)     (0.5 GPU each)
-             CLIP embed        CLIP embed          CLIP embed
-             greedy k-center   greedy k-center     greedy k-center
-             local coreset     local coreset       local coreset
+             CoresetWorker 0  CoresetWorker 1  … CoresetWorker N
+             (0.5 GPU each)   (0.5 GPU each)    (0.5 GPU each)
+             CLIP embed        CLIP embed         CLIP embed
+             greedy k-center   greedy k-center    greedy k-center
+             local coreset     local coreset      local coreset
                     │                 │                     │
                     └─────────────────┴─────────────────────┘
                                       │  global merge
@@ -46,12 +44,7 @@ import argparse
 import math
 import time
 from pathlib import Path
-from typing import List, Optional
-
-from coreset.CoresetWorker import CoresetWorker
-from coreset.ClipWorker import ClipWorker
-from ray.util.placement_group import placement_group
-from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
+from typing import List
 
 import numpy as np
 import ray
@@ -72,10 +65,6 @@ def parse_args() -> argparse.Namespace:
         help="HuggingFace dataset repo id, e.g. 'laion/laion2B-en'.",
     )
     data.add_argument(
-        "--total-cpus", type=int, required=True,
-        help="Total Cpus",
-    )
-    data.add_argument(
         "--hf-split", type=str, default="train",
         help="Dataset split to stream from.",
     )
@@ -93,14 +82,13 @@ def parse_args() -> argparse.Namespace:
     )
     data.add_argument(
         "--total-samples", type=int, default=100_000,
-        help="Stop after streaming this many images.  None streams until dataset end.",
+        help="Stop after streaming this many images.",
     )
     data.add_argument(
         "--shuffle-buffer", type=int, default=10_000,
         help=(
             "HF streaming shuffle reservoir size.  Larger = better global shuffle "
-            "at the cost of more RAM on the dispatcher node.  "
-            "Rule of thumb: 5–10× batch-size, max ~50 000 for typical machines."
+            "at the cost of more RAM on the dispatcher node."
         ),
     )
 
@@ -116,16 +104,13 @@ def parse_args() -> argparse.Namespace:
     )
     core.add_argument(
         "--batch-size", type=int, default=256,
-        help=(
-            "Images per dispatcher batch.  After embedding, the worker prunes "
-            "its buffer back to --local-coreset-size."
-        ),
+        help="Images per dispatcher batch.",
     )
 
     # ── Embedding ─────────────────────────────────────────────────────────────
     emb = p.add_argument_group("Embedding")
     emb.add_argument(
-        "--embed-batch-size", type=int, default=16,
+        "--embed-batch-size", type=int, default=128,
         help="Mini-batch size for CLIP inference inside each worker.",
     )
     emb.add_argument(
@@ -135,12 +120,14 @@ def parse_args() -> argparse.Namespace:
 
     # ── Compute ───────────────────────────────────────────────────────────────
     comp = p.add_argument_group("Compute")
-    comp.add_argument("--workers", type=int, default=4)
     comp.add_argument(
-        "--gpus", type=int, default=1.0,
-        help="Total GPUs declared to Ray (e.g. 2.0 for two physical GPUs).",
+        "--workers", type=int, default=2,
+        help="Total number of CoresetWorker actors (max 2× physical GPUs).",
     )
-    comp.add_argument("--cpus-per-worker", type=int, default=1)
+    comp.add_argument(
+        "--cpus-per-worker", type=int, default=1,
+        help="CPUs to reserve per CoresetWorker actor.",
+    )
 
     # ── Output ────────────────────────────────────────────────────────────────
     out = p.add_argument_group("Output")
@@ -165,20 +152,11 @@ def validate_args(args: argparse.Namespace) -> None:
             f"--total-samples ({args.total_samples:,})"
         )
     if args.local_coreset_size < args.embed_batch_size:
-        errors.append(
-            "--local-coreset-size should be >= --embed-batch-size."
-        )
-    # max_workers = math.floor(args.gpus / args.gpu_per_worker)
-    # if args.workers > max_workers:
-    #     errors.append(
-    #         f"--workers ({args.workers}) exceeds GPU capacity "
-    #         f"floor({args.gpus}/{args.gpu_per_worker})={max_workers}."
-    #     )
+        errors.append("--local-coreset-size should be >= --embed-batch-size.")
     if args.shuffle_buffer < args.batch_size:
         print(
             f"[Warning] --shuffle-buffer ({args.shuffle_buffer}) < --batch-size "
-            f"({args.batch_size}).  Shuffle quality will be poor.  "
-            "Consider increasing --shuffle-buffer."
+            f"({args.batch_size}).  Shuffle quality will be poor."
         )
 
     if errors:
@@ -187,33 +165,43 @@ def validate_args(args: argparse.Namespace) -> None:
         raise SystemExit(1)
 
 
+# ── Find GPU nodes in cluster ─────────────────────────────────────────────────
+
+def find_gpu_nodes() -> List[dict]:
+    """Return list of alive nodes that have at least one GPU."""
+    gpu_nodes = [
+        node for node in ray.nodes()
+        if node["Alive"] and node["Resources"].get("GPU", 0) > 0
+    ]
+    if not gpu_nodes:
+        raise RuntimeError(
+            "No GPU nodes found in the Ray cluster! "
+            "Make sure GPU nodes joined with --num-gpus=N."
+        )
+    for node in gpu_nodes:
+        print(
+            f"  [GPU node] {node['NodeManagerAddress']}  "
+            f"GPU={node['Resources'].get('GPU')}  "
+            f"CPU={node['Resources'].get('CPU')}"
+        )
+    return gpu_nodes
+
+
 # ── Work-stealing driver loop ─────────────────────────────────────────────────
 
 def run_work_stealing(workers: list, dispatcher, progress_every: int) -> None:
-    """
-    Seed every worker with its first batch, then reassign workers as they
-    finish.  Workers that find no more work drop out of the pending set.
-
-    The dispatcher pre-fetches the next batch while workers are computing —
-    GPU and network I/O overlap.
-    """
     pending = {}   # { future_ref: worker_actor }
     completed = 0
     t0 = time.time()
 
     def _dispatch_to(worker):
-        # NOTE: get_batch is called synchronously here which is fine —
-        # the dispatcher is a Ray actor so this is a remote call, not a
-        # local block.  Use a generous timeout; HF streaming can be slow.
         try:
             result = ray.get(dispatcher.get_batch.remote(), timeout=None)
         except ray.exceptions.GetTimeoutError:
             print("[Dispatcher] timed out — treating as exhausted")
             return False
-
         if result is None:
             return False
-
         future = worker.process_batch.remote(result["images"], result["ids"])
         pending[future] = worker
         return True
@@ -223,28 +211,21 @@ def run_work_stealing(workers: list, dispatcher, progress_every: int) -> None:
         _dispatch_to(w)
 
     while pending:
-        print("completed ", completed, "pending ",pending)
+        print("completed", completed, "pending", len(pending))
 
-        # ── Wait for any one worker to finish ─────────────────────────────
-        # timeout=None here is intentional: we already have max_concurrency=4
-        # on CoresetWorker and the embed call properly yields the event loop,
-        # so a worker *will* eventually finish.  A finite timeout would cause
-        # the "stuck at 199" symptom when the last batch takes slightly longer
-        # (e.g. smaller batch, GPU still warm from previous call).
         done_list, _ = ray.wait(list(pending.keys()), num_returns=1, timeout=None)
-
         done_ref = done_list[0]
         worker = pending.pop(done_ref)
 
-        # ── Surface worker-side exceptions without killing the loop ───────
-        # Previously: ray.get(done_ref) would raise and exit the function,
-        # leaving remaining futures in `pending` permanently — the "stuck at
-        # 199" case when the last worker's process_batch raised an error.
         try:
             ray.get(done_ref)
+        except ray.exceptions.ActorDiedError as exc:
+            # Actor is permanently dead — drop it, do NOT re-dispatch
+            print(f"[Worker] Actor died permanently, dropping: {exc!r}")
+            continue
         except Exception as exc:
+            # Transient error — worker still alive, re-dispatch
             print(f"[Worker] process_batch raised: {exc!r} — continuing")
-            # Worker is still alive; re-dispatch to it so it isn't lost
             _dispatch_to(worker)
             continue
 
@@ -266,9 +247,9 @@ def run_work_stealing(workers: list, dispatcher, progress_every: int) -> None:
                 f"ETA {eta:.0f}s"
             )
 
-        # Re-dispatch this worker; if exhausted it simply won't be added
-        # back to `pending` and will drop out of the loop naturally.
         _dispatch_to(worker)
+
+
 # ── Global merge ──────────────────────────────────────────────────────────────
 
 def global_merge(workers: list, final_coreset_size: int) -> tuple:
@@ -276,21 +257,24 @@ def global_merge(workers: list, final_coreset_size: int) -> tuple:
 
     all_embs, all_ids = [], []
     for w in workers:
-        embs, ids = ray.get(w.get_coreset.remote())
-        if embs is not None and len(embs) > 0:
-            all_embs.append(embs)
-            all_ids.append(ids)
+        try:
+            embs, ids = ray.get(w.get_coreset.remote())
+            if embs is not None and len(embs) > 0:
+                all_embs.append(embs)
+                all_ids.append(ids)
+        except Exception as exc:
+            print(f"[Global merge] Could not retrieve coreset from worker: {exc!r}")
 
     if not all_embs:
         raise RuntimeError("No embeddings collected — nothing to merge.")
 
     pool_embs = np.concatenate(all_embs, axis=0)
-    pool_ids = np.concatenate(all_ids, axis=0)
+    pool_ids  = np.concatenate(all_ids,  axis=0)
 
-    # Deduplicate by stream ID (same image may appear in two worker coresets)
+    # Deduplicate by stream ID
     _, unique_mask = np.unique(pool_ids, return_index=True)
     pool_embs = pool_embs[unique_mask]
-    pool_ids = pool_ids[unique_mask]
+    pool_ids  = pool_ids[unique_mask]
 
     print(f"[Global merge] Pool after dedup: {len(pool_embs):,} candidates")
 
@@ -318,16 +302,31 @@ def main() -> None:
     print(f"  Local coreset   : {args.local_coreset_size:,}  (per worker)")
     print(f"  Batch size      : {args.batch_size:,}  (images per round)")
     print(f"  Embed batch     : {args.embed_batch_size}  (images per CLIP call)")
+    print(f"  Workers         : {args.workers}  (0.5 GPU each)")
     print(f"  Model           : {args.model}")
     print(f"  Output          : {args.output}")
     print(f"  Seed            : {args.seed}")
     print("=" * 64)
 
     # ── Ray init ──────────────────────────────────────────────────────────────
-    ray.init(num_cpus=args.total_cpus, num_gpus=args.gpus)
+    ray.init(address="auto")
     print(f"[Ray] Cluster resources: {ray.cluster_resources()}")
+
     args.total_samples = (args.total_samples // args.batch_size) * args.batch_size
     print(f"[Info] Rounded total_samples to {args.total_samples} (multiple of batch_size)")
+
+    # ── Find real GPU nodes and validate worker count ─────────────────────────
+    print(f"\n[Info] Scanning cluster for GPU nodes ...")
+    gpu_nodes = find_gpu_nodes()
+    total_gpu_capacity = sum(n["Resources"].get("GPU", 0) for n in gpu_nodes)
+    max_workers = int(total_gpu_capacity * 2)  # 0.5 GPU each → 2 workers per GPU
+    if args.workers > max_workers:
+        print(
+            f"[Warning] --workers ({args.workers}) > cluster GPU capacity "
+            f"({total_gpu_capacity} GPUs × 2 = {max_workers} max). "
+            f"Clamping to {max_workers}."
+        )
+        args.workers = max_workers
 
     # ── HF kwargs ─────────────────────────────────────────────────────────────
     hf_kwargs = {}
@@ -336,14 +335,7 @@ def main() -> None:
     if args.hf_token:
         hf_kwargs["token"] = args.hf_token
 
-    # EMBED
-    MODEL = "openai/clip-vit-base-patch32"
-    EMBED_BATCH = 128
-
-
-
-
-    # ── Step 1: Dispatcher (owns the HF stream) ───────────────────────────────
+    # ── Step 1: Dispatcher ────────────────────────────────────────────────────
     print(f"\n[1/3] Launching dispatcher ...")
     from coreset.dispatcher import WorkDispatcher
 
@@ -358,41 +350,34 @@ def main() -> None:
         **hf_kwargs,
     )
     total_batches = (
-        math.ceil(args.total_samples / args.batch_size)
-        if args.total_samples
-        else "?"
+        math.ceil(args.total_samples / args.batch_size) if args.total_samples else "?"
     )
     print(f"      ~{total_batches} batches of {args.batch_size} images each.")
 
-   # ── Step 2: Spawn workers ─────────────────────────────────────────────────
-    print(f"\n[2/3] Spawning {args.workers} workers ...")
+    # ── Step 2: Spawn workers pinned to real GPU nodes ────────────────────────
+    print(f"\n[2/3] Spawning {args.workers} CoresetWorkers (0.5 GPU each) ...")
+    from coreset.CoresetWorker import CoresetWorker
+    from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 
-    workers_per_gpu = args.workers // args.gpus
-    embedders = []
     workers = []
-
-    for i in range(args.gpus):
-        pg = placement_group(
-            bundles=[{"GPU": 1, "CPU": 1}] + [{"CPU": args.cpus_per_worker} for _ in range(workers_per_gpu)],
-            strategy="STRICT_PACK",
+    for i in range(args.workers):
+        # Round-robin across GPU nodes (handles multi-GPU-node clusters)
+        node = gpu_nodes[i % len(gpu_nodes)]
+        worker = CoresetWorker.options(
+            num_gpus=0.5,
+            num_cpus=args.cpus_per_worker,
+            scheduling_strategy=NodeAffinitySchedulingStrategy(
+                node_id=node["NodeID"],
+                soft=False,  # hard pin — never fall back to a CPU-only node
+            ),
+        ).remote(
+            worker_id=i,
+            coreset_size=args.local_coreset_size,
+            model_name=args.model,
+            embed_batch_size=args.embed_batch_size,
         )
-        ray.get(pg.ready())
-
-        embedder = ClipWorker.options(
-            num_gpus=1.0,
-            scheduling_strategy=PlacementGroupSchedulingStrategy(pg, placement_group_bundle_index=0),
-        ).remote(MODEL, EMBED_BATCH)
-        embedders.append(embedder)
-
-        for j in range(workers_per_gpu):
-            workers.append(CoresetWorker.options(
-                num_cpus=args.cpus_per_worker,
-                scheduling_strategy=PlacementGroupSchedulingStrategy(pg, placement_group_bundle_index=j + 1),
-            ).remote(
-                worker_id=i * workers_per_gpu + j,
-                coreset_size=args.local_coreset_size,
-                embedder=embedder,
-            ))
+        workers.append(worker)
+        print(f"  Worker {i} → {node['NodeManagerAddress']}")
 
     # ── Step 3: Work-stealing loop ────────────────────────────────────────────
     print(f"\n[3/3] Processing batches (work-stealing) ...\n")
@@ -402,13 +387,16 @@ def main() -> None:
     print(f"\n[Done] All batches processed in {t_elapsed:.1f}s")
 
     for w in workers:
-        s = ray.get(w.stats.remote())
-        print(
-            f"  Worker {s['worker_id']}: "
-            f"{s['batches_processed']} batches, "
-            f"coreset_size={s['coreset_size']}, "
-            f"skipped={s['images_skipped']} images"
-        )
+        try:
+            s = ray.get(w.stats.remote())
+            print(
+                f"  Worker {s['worker_id']}: "
+                f"{s['batches_processed']} batches, "
+                f"coreset_size={s['coreset_size']}, "
+                f"skipped={s['images_skipped']} images"
+            )
+        except Exception as exc:
+            print(f"  Worker stats unavailable: {exc!r}")
 
     # ── Global merge ──────────────────────────────────────────────────────────
     print(f"\n[Global] Merging → selecting {args.final_coreset_size:,} ...")
@@ -422,7 +410,7 @@ def main() -> None:
     # ── Save ──────────────────────────────────────────────────────────────────
     out_dir = Path(args.output)
     out_dir.mkdir(parents=True, exist_ok=True)
-    np.save(out_dir / "coreset_indices.npy", final_ids)
+    np.save(out_dir / "coreset_indices.npy",    final_ids)
     np.save(out_dir / "coreset_embeddings.npy", final_embeddings)
 
     print(f"\n[Saved]")
