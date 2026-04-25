@@ -7,7 +7,8 @@ Usage example:
         --hf-split train \
         --hf-image-col image \
         --total-samples 100000 \
-        --shuffle-buffer 20000 \
+        --page-size 10000 \
+        --sample-size 1000 \
         --final-coreset-size 10000 \
         --local-coreset-size 1000 \
         --batch-size 256 \
@@ -17,15 +18,26 @@ Usage example:
         --output ./coreset_output \
         --seed 42
 
+Stopping logic
+──────────────
+    page_size × n_pages = total_samples   (guaranteed)
+
+    e.g. page_size=10,000 × 10 pages = 100,000 total_samples
+
+    sample_size  → how many kept per page  (shuffle quality)
+    batch_size   → how workers receive chunks (throughput)
+    Neither affects how much of the stream is covered.
+
 Architecture recap
 ──────────────────
                       ┌─────────────────────────────────────┐
                       │  WorkDispatcher (Ray actor)          │
                       │  • Owns ONE HF streaming iterator    │
-   HuggingFace Hub ──►│  • shuffle buffer (RAM, configurable)│
-   (4 TB, remote)     │  • Emits batches as Ray object refs  │
+   HuggingFace Hub ──►│  • Streams past page_size per refill │
+   (4 TB, remote)     │  • Keeps sample_size per page        │
+                      │  • Stops after n_pages = total/page  │
                       └───────────────┬─────────────────────┘
-                                      │  (images_ref, ids_ref)
+                                      │  (images, ids)
                     ┌─────────────────┼────────────────────┐
                     ▼                 ▼                     ▼
              CoresetWorker 0  CoresetWorker 1  … CoresetWorker N
@@ -82,13 +94,24 @@ def parse_args() -> argparse.Namespace:
     )
     data.add_argument(
         "--total-samples", type=int, default=100_000,
-        help="Stop after streaming this many images.",
+        help=(
+            "Total stream positions to cover. Must be a multiple of --page-size. "
+            "n_pages = total_samples // page_size."
+        ),
     )
     data.add_argument(
-        "--shuffle-buffer", type=int, default=10_000,
+        "--page-size", type=int, default=10_000,
         help=(
-            "HF streaming shuffle reservoir size.  Larger = better global shuffle "
-            "at the cost of more RAM on the dispatcher node."
+            "Stream positions advanced per refill. "
+            "total_samples // page_size = number of pages. "
+            "Larger = better dataset coverage per page."
+        ),
+    )
+    data.add_argument(
+        "--sample-size", type=int, default=1_000,
+        help=(
+            "Examples kept per page (stride = page_size // sample_size). "
+            "Must be <= page_size. Controls shuffle quality, not stream coverage."
         ),
     )
 
@@ -104,7 +127,10 @@ def parse_args() -> argparse.Namespace:
     )
     core.add_argument(
         "--batch-size", type=int, default=256,
-        help="Images per dispatcher batch.",
+        help=(
+            "Images per dispatcher batch handed to each worker. "
+            "Controls throughput only — does not affect stream coverage."
+        ),
     )
 
     # ── Embedding ─────────────────────────────────────────────────────────────
@@ -146,17 +172,36 @@ def parse_args() -> argparse.Namespace:
 def validate_args(args: argparse.Namespace) -> None:
     errors: List[str] = []
 
-    if args.total_samples and args.final_coreset_size > args.total_samples:
+    if args.total_samples < args.page_size:
+        errors.append(
+            f"--total-samples ({args.total_samples:,}) must be >= "
+            f"--page-size ({args.page_size:,})."
+        )
+    if args.total_samples % args.page_size != 0:
+        # round down and warn rather than hard error
+        rounded = (args.total_samples // args.page_size) * args.page_size
+        print(
+            f"[Warning] --total-samples ({args.total_samples:,}) is not a multiple of "
+            f"--page-size ({args.page_size:,}). Rounding down to {rounded:,}."
+        )
+        args.total_samples = rounded
+
+    if args.sample_size > args.page_size:
+        errors.append(
+            f"--sample-size ({args.sample_size:,}) must be <= "
+            f"--page-size ({args.page_size:,})."
+        )
+    if args.final_coreset_size > args.total_samples:
         errors.append(
             f"--final-coreset-size ({args.final_coreset_size:,}) > "
-            f"--total-samples ({args.total_samples:,})"
+            f"--total-samples ({args.total_samples:,})."
         )
     if args.local_coreset_size < args.embed_batch_size:
         errors.append("--local-coreset-size should be >= --embed-batch-size.")
-    if args.shuffle_buffer < args.batch_size:
+    if args.batch_size > args.sample_size:
         print(
-            f"[Warning] --shuffle-buffer ({args.shuffle_buffer}) < --batch-size "
-            f"({args.batch_size}).  Shuffle quality will be poor."
+            f"[Warning] --batch-size ({args.batch_size}) > --sample-size "
+            f"({args.sample_size}). Workers may stall waiting for page refills."
         )
 
     if errors:
@@ -189,65 +234,125 @@ def find_gpu_nodes() -> List[dict]:
 
 # ── Work-stealing driver loop ─────────────────────────────────────────────────
 
-def run_work_stealing(workers: list, dispatcher, progress_every: int) -> None:
-    pending = {}   # { future_ref: worker_actor }
+def run_work_stealing(workers, dispatcher, progress_every):
+    pending_work  = {}   # { work_ref: worker }
+    pending_fetch = {}   # { fetch_ref: worker }
+    free_workers  = list(workers)   # workers waiting for a batch
     completed = 0
     t0 = time.time()
 
-    def _dispatch_to(worker):
-        try:
-            result = ray.get(dispatcher.get_batch.remote(), timeout=None)
-        except ray.exceptions.GetTimeoutError:
-            print("[Dispatcher] timed out — treating as exhausted")
-            return False
-        if result is None:
-            return False
-        future = worker.process_batch.remote(result["images"], result["ids"])
-        pending[future] = worker
-        return True
+    # Pre-fetch one batch per worker immediately
+    for w in free_workers:
+        ref = dispatcher.get_batch.remote()
+        pending_fetch[ref] = w
 
-    # Seed all workers
-    for w in workers:
-        _dispatch_to(w)
+    free_workers = []  # all workers now have a fetch in flight
 
-    while pending:
-        print("completed", completed, "pending", len(pending))
-
-        done_list, _ = ray.wait(list(pending.keys()), num_returns=1, timeout=None)
+    while pending_work or pending_fetch:
+        all_refs = list(pending_work.keys()) + list(pending_fetch.keys())
+        done_list, _ = ray.wait(all_refs, num_returns=1, timeout=None)
         done_ref = done_list[0]
-        worker = pending.pop(done_ref)
 
-        try:
-            ray.get(done_ref)
-        except ray.exceptions.ActorDiedError as exc:
-            # Actor is permanently dead — drop it, do NOT re-dispatch
-            print(f"[Worker] Actor died permanently, dropping: {exc!r}")
-            continue
-        except Exception as exc:
-            # Transient error — worker still alive, re-dispatch
-            print(f"[Worker] process_batch raised: {exc!r} — continuing")
-            _dispatch_to(worker)
-            continue
+        if done_ref in pending_fetch:
+            worker = pending_fetch.pop(done_ref)
+            result = ray.get(done_ref)
 
-        completed += 1
+            if result is None:
+                continue  # exhausted, retire this worker
 
-        if completed % progress_every == 0:
-            prog = ray.get(dispatcher.progress.remote())
-            elapsed = time.time() - t0
-            issued = prog["images_issued"]
-            total = prog["total_samples"] or "?"
-            pct_str = f"{prog['pct']:.1f}%" if prog["total_samples"] else "?%"
-            remaining = prog.get("remaining")
-            rate = issued / elapsed if elapsed > 0 else 0
-            eta = (remaining / rate) if (remaining and rate > 0) else float("inf")
-            print(
-                f"[Progress] {pct_str}  |  "
-                f"{issued:,}/{total} images  |  "
-                f"{elapsed:.0f}s elapsed  |  "
-                f"ETA {eta:.0f}s"
-            )
+            # Fire the work immediately
+            work_ref = worker.process_batch.remote(result["images"], result["ids"])
+            pending_work[work_ref] = worker
 
-        _dispatch_to(worker)
+            # Fire the NEXT fetch immediately too — don't wait for work to finish
+            next_ref = dispatcher.get_batch.remote()
+            pending_fetch[next_ref] = worker   # same worker, next batch
+
+        else:
+            worker = pending_work.pop(done_ref)
+            try:
+                ray.get(done_ref)
+            except ray.exceptions.ActorDiedError as exc:
+                print(f"[Worker] died: {exc!r}")
+                continue
+            except Exception as exc:
+                print(f"[Worker] error: {exc!r}")
+
+            completed += 1
+            if completed % progress_every == 0:
+                prog = ray.get(dispatcher.progress.remote())
+                elapsed = time.time() - t0
+                issued  = prog["images_issued"]
+                total   = prog["total_samples"]
+                rate    = issued / elapsed if elapsed > 0 else 0
+                eta     = (prog["remaining"] / rate) if rate > 0 else float("inf")
+                print(
+                    f"[Progress] {prog['pct']:.1f}%  |  "
+                    f"{issued:,}/{total:,} images  |  "
+                    f"{elapsed:.0f}s elapsed  |  ETA {eta:.0f}s"
+                )
+                
+# def run_work_stealing(workers: list, dispatcher, progress_every: int) -> None:
+#     pending_work  = {}   # { process_batch_future: worker }
+#     pending_fetch = {}   # { get_batch_future:     worker }
+#     completed = 0
+#     t0 = time.time()
+
+#     # Seed: fire one non-blocking dispatcher fetch per worker
+#     for w in workers:
+#         ref = dispatcher.get_batch.remote()
+#         pending_fetch[ref] = w
+
+#     while pending_work or pending_fetch:
+#         all_refs = list(pending_work.keys()) + list(pending_fetch.keys())
+#         done_list, _ = ray.wait(all_refs, num_returns=1, timeout=None)
+#         done_ref = done_list[0]
+
+#         # ── A dispatcher fetch completed ──────────────────────────────────────
+#         if done_ref in pending_fetch:
+#             worker = pending_fetch.pop(done_ref)
+#             try:
+#                 result = ray.get(done_ref)
+#             except Exception as exc:
+#                 print(f"[Dispatcher] fetch error: {exc!r}")
+#                 continue
+
+#             if result is None:
+#                 # Dispatcher exhausted — this worker is done, don't requeue
+#                 continue
+
+#             # Immediately pipeline the NEXT fetch for this worker
+#             next_fetch = dispatcher.get_batch.remote()
+#             pending_fetch[next_fetch] = worker
+
+#             # Fire the compute work (non-blocking — just enqueues on Ray)
+#             work_ref = worker.process_batch.remote(result["images"], result["ids"])
+#             pending_work[work_ref] = worker
+
+#         # ── A worker finished its batch ───────────────────────────────────────
+#         else:
+#             worker = pending_work.pop(done_ref)
+#             try:
+#                 ray.get(done_ref)
+#             except ray.exceptions.ActorDiedError as exc:
+#                 print(f"[Worker] Actor died permanently, dropping: {exc!r}")
+#                 continue
+#             except Exception as exc:
+#                 print(f"[Worker] process_batch raised: {exc!r} — continuing")
+
+#             completed += 1
+#             if completed % progress_every == 0:
+#                 prog = ray.get(dispatcher.progress.remote())
+#                 elapsed = time.time() - t0
+#                 issued  = prog["images_issued"]
+#                 total   = prog["total_samples"]
+#                 rate    = issued / elapsed if elapsed > 0 else 0
+#                 eta     = (prog["remaining"] / rate) if rate > 0 else float("inf")
+#                 print(
+#                     f"[Progress] {prog['pct']:.1f}%  |  "
+#                     f"{issued:,}/{total:,} images  |  "
+#                     f"{elapsed:.0f}s elapsed  |  ETA {eta:.0f}s"
+#                 )
 
 
 # ── Global merge ──────────────────────────────────────────────────────────────
@@ -289,6 +394,9 @@ def main() -> None:
     args = parse_args()
     validate_args(args)
 
+    n_pages = args.total_samples // args.page_size
+    stride  = args.page_size // args.sample_size
+
     np.random.seed(args.seed)
 
     print("=" * 64)
@@ -296,11 +404,14 @@ def main() -> None:
     print("=" * 64)
     print(f"  HF dataset      : {args.hf_dataset}  (split={args.hf_split})")
     print(f"  Image column    : {args.hf_image_col}")
-    print(f"  Total samples   : {args.total_samples:,}")
-    print(f"  Shuffle buffer  : {args.shuffle_buffer:,}")
+    print(f"  Total samples   : {args.total_samples:,}  (stream positions covered)")
+    print(f"  Page size       : {args.page_size:,}  (positions per refill)")
+    print(f"  Sample size     : {args.sample_size:,}  (kept per page)")
+    print(f"  Stride          : {stride}x  (1 in {stride} kept)")
+    print(f"  n_pages         : {n_pages}  (page_size × n_pages = total_samples)")
+    print(f"  Batch size      : {args.batch_size:,}  (images per worker round)")
     print(f"  Final coreset   : {args.final_coreset_size:,}")
     print(f"  Local coreset   : {args.local_coreset_size:,}  (per worker)")
-    print(f"  Batch size      : {args.batch_size:,}  (images per round)")
     print(f"  Embed batch     : {args.embed_batch_size}  (images per CLIP call)")
     print(f"  Workers         : {args.workers}  (0.5 GPU each)")
     print(f"  Model           : {args.model}")
@@ -310,16 +421,14 @@ def main() -> None:
 
     # ── Ray init ──────────────────────────────────────────────────────────────
     ray.init(address="auto")
+    t_start = time.time()
     print(f"[Ray] Cluster resources: {ray.cluster_resources()}")
-
-    args.total_samples = (args.total_samples // args.batch_size) * args.batch_size
-    print(f"[Info] Rounded total_samples to {args.total_samples} (multiple of batch_size)")
 
     # ── Find real GPU nodes and validate worker count ─────────────────────────
     print(f"\n[Info] Scanning cluster for GPU nodes ...")
     gpu_nodes = find_gpu_nodes()
     total_gpu_capacity = sum(n["Resources"].get("GPU", 0) for n in gpu_nodes)
-    max_workers = int(total_gpu_capacity * 2)  # 0.5 GPU each → 2 workers per GPU
+    max_workers = int(total_gpu_capacity * 2)
     if args.workers > max_workers:
         print(
             f"[Warning] --workers ({args.workers}) > cluster GPU capacity "
@@ -343,15 +452,15 @@ def main() -> None:
         dataset_name=args.hf_dataset,
         split=args.hf_split,
         image_col=args.hf_image_col,
-        shuffle_buffer=args.shuffle_buffer,
+        page_size=args.page_size,
+        sample_size=args.sample_size,
+        total_samples=args.total_samples,
         seed=args.seed,
         batch_size=args.batch_size,
-        total_samples=args.total_samples,
         **hf_kwargs,
     )
-    total_batches = (
-        math.ceil(args.total_samples / args.batch_size) if args.total_samples else "?"
-    )
+    total_batches = math.ceil(args.total_samples / args.batch_size)
+    print(f"      {n_pages} pages × {args.page_size:,} positions = {args.total_samples:,} total.")
     print(f"      ~{total_batches} batches of {args.batch_size} images each.")
 
     # ── Step 2: Spawn workers pinned to real GPU nodes ────────────────────────
@@ -361,14 +470,13 @@ def main() -> None:
 
     workers = []
     for i in range(args.workers):
-        # Round-robin across GPU nodes (handles multi-GPU-node clusters)
         node = gpu_nodes[i % len(gpu_nodes)]
         worker = CoresetWorker.options(
             num_gpus=0.5,
             num_cpus=args.cpus_per_worker,
             scheduling_strategy=NodeAffinitySchedulingStrategy(
                 node_id=node["NodeID"],
-                soft=False,  # hard pin — never fall back to a CPU-only node
+                soft=False,
             ),
         ).remote(
             worker_id=i,
@@ -381,10 +489,14 @@ def main() -> None:
 
     # ── Step 3: Work-stealing loop ────────────────────────────────────────────
     print(f"\n[3/3] Processing batches (work-stealing) ...\n")
-    t_start = time.time()
+    
     run_work_stealing(workers, dispatcher, args.progress_every)
     t_elapsed = time.time() - t_start
     print(f"\n[Done] All batches processed in {t_elapsed:.1f}s")
+
+    ray.kill(dispatcher)
+    dispatcher = None
+    print("[Info] Dispatcher released (3 CPUs freed).")
 
     for w in workers:
         try:

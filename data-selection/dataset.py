@@ -1,26 +1,28 @@
-%%writefile dataset.py
-
 """
 HuggingFace streaming image dataset.
 
-Key design decisions for a 4 TB remote dataset
-───────────────────────────────────────────────
-1. `streaming=True`  — never materialises the dataset locally; images are
-   fetched on-demand from the HF hub (or S3 mirror) via HTTP range requests.
+Stopping logic
+──────────────
+The program covers exactly `total_samples` stream positions, guaranteed:
 
-2. `.shuffle(buffer_size, seed)`  — HF's built-in streaming shuffle fills a
-   RAM buffer of `buffer_size` decoded examples, then samples from it uniformly.
-   This gives a good approximation of a global shuffle at O(buffer_size) RAM
-   cost rather than O(dataset_size).  Typical good value: 10 000 – 50 000.
+    page_size × n_pages = total_samples
 
-3. Lazy decoding  — each item is decoded only when pulled from the iterator.
-   The PIL image is returned and immediately discarded by the caller after
-   embedding; nothing accumulates in memory.
+    e.g. page_size=10,000 × 10 pages = 100,000 total_samples
 
-4. Fault tolerance  — corrupt / undecodable shards produce None; callers skip
-   those slots without crashing.
+`sample_size` and `batch_size` are irrelevant to how much of the stream is
+covered — they only control shuffle quality and worker throughput respectively.
+
+Each page:
+    1. Stream past `page_size` positions  (touches exactly page_size examples)
+    2. Keep every stride-th one           (stride = page_size // sample_size)
+    3. Shuffle kept examples locally
+    4. Serve chunks of `batch_size` from the kept examples
+
+When `_pages_issued == n_pages` the dataset marks itself exhausted and
+next_chunk() returns empty lists, which propagates up to the dispatcher.
 """
 
+import random
 from typing import Iterator, List, Optional, Tuple
 
 from PIL import Image
@@ -28,23 +30,21 @@ from PIL import Image
 
 class HFStreamingDataset:
     """
-    Wraps a HuggingFace IterableDataset for lazy, shuffled image streaming.
+    Wraps a HuggingFace IterableDataset for lazy, strided image streaming.
 
     Args:
         dataset_name:   HF repo id, e.g. "laion/laion2B-en" or a local path.
         split:          Dataset split string, e.g. "train".
         image_col:      Name of the column that holds the image.
-                        - If the column dtype is Image (already decoded PIL),
-                          it is used directly.
-                        - If the column dtype is dict with a "bytes" key
-                          (raw bytes), it is decoded here.
-                        - If the column holds a URL string, it is fetched.
-        shuffle_buffer: Number of examples kept in the shuffle reservoir.
-                        Larger = better randomness, more RAM.
-                        Set to 0 or None to disable shuffling (not recommended).
-        seed:           RNG seed passed to the HF shuffle.
-        hf_kwargs:      Extra keyword arguments forwarded to `load_dataset`
-                        (e.g. `use_auth_token`, `data_files`, `name`).
+        page_size:      Number of stream positions to advance past per refill.
+                        Must divide evenly into total_samples.
+        sample_size:    Number of examples to keep per page.
+                        stride = page_size // sample_size.
+                        Must be <= page_size.
+        total_samples:  Total stream positions to cover.
+                        n_pages = total_samples // page_size.
+        seed:           RNG seed for local page shuffle.
+        hf_kwargs:      Extra keyword arguments forwarded to `load_dataset`.
     """
 
     def __init__(
@@ -52,13 +52,25 @@ class HFStreamingDataset:
         dataset_name: str,
         split: str = "train",
         image_col: str = "image",
-        shuffle_buffer: int = 10_000,
+        page_size: int = 10_000,
+        sample_size: int = 1_000,
+        total_samples: int = 100_000,
         seed: int = 42,
         **hf_kwargs,
     ):
         from datasets import load_dataset
 
-        self.image_col = image_col
+        assert sample_size <= page_size, "sample_size must be <= page_size"
+        assert total_samples >= page_size, "total_samples must be >= page_size"
+
+        self.image_col    = image_col
+        self._page_size   = page_size
+        self._sample_size = sample_size
+        self._stride      = page_size // sample_size    # e.g. 10000//1000 = 10
+        self._n_pages     = total_samples // page_size  # e.g. 100000//10000 = 10
+        self._pages_issued = 0
+
+        random.seed(seed)
 
         ds = load_dataset(
             dataset_name,
@@ -68,24 +80,25 @@ class HFStreamingDataset:
             **hf_kwargs,
         )
 
-        if shuffle_buffer:
-            ds = ds.shuffle(buffer_size=shuffle_buffer, seed=seed)
-
         # Cast the image column so HF decodes bytes → PIL automatically
-        # (only applies when the column has the Image feature type)
         try:
             from datasets import Image as HFImage
             if image_col in ds.features and isinstance(ds.features[image_col], HFImage):
                 ds = ds.cast_column(image_col, HFImage(decode=True))
         except Exception:
-            pass  # non-fatal; we handle raw bytes below
+            pass
 
         self._ds = ds
         self._iter: Optional[Iterator] = None
+        self._page: List = []
+        self._cursor: int = 0
+        self._exhausted: bool = False
 
         print(
             f"[HFStreamingDataset] '{dataset_name}' split='{split}' "
-            f"image_col='{image_col}' shuffle_buffer={shuffle_buffer}"
+            f"image_col='{image_col}' page_size={page_size} "
+            f"sample_size={sample_size} stride={self._stride} "
+            f"n_pages={self._n_pages} total_samples={total_samples}"
         )
 
     # ── Internal helpers ──────────────────────────────────────────────────────
@@ -94,6 +107,45 @@ class HFStreamingDataset:
         if self._iter is None:
             self._iter = iter(self._ds)
         return self._iter
+
+    def _refill_page(self) -> None:
+        """
+        Stream past exactly page_size positions, keeping every stride-th one.
+        Skipped examples cost only a raw next() — no image decode, no download.
+        Kept examples are shuffled locally before being stored in self._page.
+
+        Stops once n_pages have been issued, guaranteeing:
+            page_size × n_pages = total_samples stream positions covered.
+        """
+        if self._pages_issued >= self._n_pages:
+            self._exhausted = True
+            return
+
+        it = self._get_iter()
+        kept = []
+        fetched = 0
+
+        while fetched < self._page_size:
+            try:
+                example = next(it)      # keep this one
+                kept.append(example)
+                fetched += 1
+                # skip (stride-1) examples — raw next(), no decode
+                for _ in range(self._stride - 1):
+                    next(it)
+                    fetched += 1
+            except StopIteration:
+                # HF stream physically exhausted before n_pages reached
+                self._exhausted = True
+                break
+
+        random.shuffle(kept)
+        self._page = kept
+        self._pages_issued += 1
+
+        # mark exhausted after the final page
+        if self._pages_issued >= self._n_pages:
+            self._exhausted = True
 
     def _decode_image(self, raw) -> Optional[Image.Image]:
         """
@@ -122,7 +174,6 @@ class HFStreamingDataset:
                 return Image.open(io.BytesIO(raw)).convert("RGB")
 
             if isinstance(raw, str):
-                # Treat as URL — fetch with a short timeout
                 import io, urllib.request
                 with urllib.request.urlopen(raw, timeout=10) as resp:
                     return Image.open(io.BytesIO(resp.read())).convert("RGB")
@@ -137,56 +188,62 @@ class HFStreamingDataset:
 
     def next_chunk(
         self, chunk_size: int
-    ) -> Tuple[List[Optional[Image.Image]], List[int]]:
+    ) -> Tuple[List[Optional[bytes]], List[int]]:
         """
-        Pull the next `chunk_size` examples from the stream.
+        Pull the next `chunk_size` examples from the current page.
+        Refills the page automatically when it runs dry.
 
         Returns:
-            images:   list of PIL Images (or None for failed decodes).
-            ids:      list of monotonically increasing stream positions
-                      (used as stable identifiers in the coreset index).
+            images:   list of PNG bytes (or None for failed decodes).
+            ids:      list of monotonically increasing stream positions.
 
-        When the stream is exhausted the lists may be shorter than chunk_size
-        (or empty).  The caller should treat an empty return as "done".
+        Returns empty lists once all n_pages have been issued.
         """
-        it = self._get_iter()
-        images: List[Optional[Image.Image]] = []
+        images: List[Optional[bytes]] = []
         ids: List[int] = []
 
-        start_id = getattr(self, "_cursor", 0)
+        while len(images) < chunk_size:
+            if not self._page:
+                if self._exhausted:
+                    break
+                self._refill_page()
+                if not self._page:
+                    break
 
-        for local_i in range(chunk_size):
-            try:
-                example = next(it)
-            except StopIteration:
-                break
+            need = chunk_size - len(images)
+            batch, self._page = self._page[:need], self._page[need:]
 
-            raw_list = example.get(self.image_col)
-            # print(f"[DEBUG] raw_list type={type(raw_list)}, value={str(raw_list)[:200]}")
+            for example in batch:
+                raw = example.get(self.image_col)
 
-            if not raw_list or len(raw_list) == 0:
-                images.append(None)
-                ids.append(start_id + local_i)  # ← always append id
-                continue
+                if not raw or (isinstance(raw, list) and len(raw) == 0):
+                    images.append(None)
+                    ids.append(self._cursor)
+                    self._cursor += 1
+                    continue
 
-            raw = raw_list[0] if isinstance(raw_list, list) else raw_list
-            img = self._decode_image(raw)
+                raw = raw[0] if isinstance(raw, list) else raw
+                img = self._decode_image(raw)
 
-            if img is not None:
-                import io
-                buf = io.BytesIO()
-                img.save(buf, format="PNG")
-                images.append(buf.getvalue())
-            else:
-                images.append(None)
-            ids.append(start_id + local_i) 
+                if img is not None:
+                    import io
+                    buf = io.BytesIO()
+                    img.save(buf, format="PNG")
+                    images.append(buf.getvalue())
+                else:
+                    images.append(None)
 
-        self._cursor = start_id + len(images)
+                ids.append(self._cursor)
+                self._cursor += 1
+
         return images, ids
 
     def reset(self, seed: Optional[int] = None) -> None:
-        """Re-create the iterator (new shuffle permutation if seed differs)."""
+        """Re-create the iterator from the start."""
         if seed is not None:
-            self._ds = self._ds.shuffle(buffer_size=self._ds._ex_iterable.ex_iterable.buffer_size, seed=seed)
+            random.seed(seed)
         self._iter = None
+        self._page = []
         self._cursor = 0
+        self._pages_issued = 0
+        self._exhausted = False

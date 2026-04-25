@@ -1,0 +1,21 @@
+ompleted 77 pending 1
+(CoresetWorker pid=16096, ip=10.192.11.167) [Worker 1] embedding 128 images ...
+
+[Done] All batches processed in 1345.9s
+  Worker 0: 39 batches, coreset_size=500, skipped=0 images
+  Worker 1: 39 batches, coreset_size=500, skipped=0 images
+
+[Global] Merging → selecting 1,000 ...
+[Global merge] Pool after dedup: 1,000 candidates
+[Global] Done in 0.0s. Final coreset: 1,000 points.
+(CoresetWorker pid=16096, ip=10.192.11.167) [Worker 1] embed done, got 128 embeddings
+
+[Saved]
+  coreset_output/coreset_indices.npy    — shape (1000,)
+  coreset_output/coreset_embeddings.npy — shape (1000, 512)
+
+Total wall time: 1345.9s
+Loading weights: 100%|██████████| 398/398 [00:00<00:00, 13274.59it/s]
+
+
+1T4 4cpu + 4 cpu

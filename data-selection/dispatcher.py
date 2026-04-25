@@ -1,69 +1,59 @@
-%%writefile dispatcher.py
 """
 Work dispatcher Ray actor — HuggingFace streaming edition.
 
-Architecture change vs. the file-based version
-───────────────────────────────────────────────
-Previously: dispatcher handed out *integer index arrays*; workers loaded
-  images themselves from a local directory.
+Stopping logic
+──────────────
+Stopping is driven entirely by the dataset via page counting:
 
-Now: the dataset lives on HuggingFace (4 TB, remote).  We cannot give each
-  worker its own independent HF stream — that would multiply network traffic
-  by the number of workers and defeat the shuffle buffer (each worker would
-  see a different, small portion of the buffer).
+    page_size × n_pages = total_samples
 
-Solution — single stream, pre-fetched batches:
-  1. The dispatcher owns ONE HFStreamingDataset iterator.
-  2. It reads `batch_size` images at a time from that iterator.
-  3. Each batch is returned directly as plain Python objects; Ray serializes
-     them through its object store automatically when passing to workers.
-  4. Workers receive (images, ids) directly — no ray.get() call needed.
+The dataset marks itself exhausted after n_pages refills. When next_chunk()
+returns an empty list, _fetch_one() propagates exhaustion up to get_batch(),
+which returns None to workers — signalling the work-stealing loop to stop.
 
-Thread-safety: Ray actors execute methods serially — no locks needed.
+Queue filling
+─────────────
+A background thread continuously keeps self._queue topped up to MAX_QUEUE
+batches. The lock is held ONLY when reading/writing the queue or flags —
+never during HF I/O — so get_batch() always returns instantly.
 """
 
-from typing import Optional, Tuple
-
+import threading
+import time
+from typing import Optional, List
 import ray
+
+
+MAX_QUEUE = 16
 
 
 @ray.remote
 class WorkDispatcher:
-    """
-    Streams batches from a HuggingFace dataset and hands them to workers.
-
-    Args:
-        dataset_name:    HF repo id (e.g. "laion/laion2B-en").
-        split:           Dataset split (e.g. "train").
-        image_col:       Column name for images.
-        shuffle_buffer:  HF shuffle reservoir size.
-        seed:            RNG seed.
-        batch_size:      Images per batch handed to each worker.
-        total_samples:   Stop after this many images (None = stream forever).
-        hf_kwargs:       Forwarded to load_dataset.
-    """
 
     def __init__(
         self,
         dataset_name: str,
         split: str,
         image_col: str,
-        shuffle_buffer: int,
+        page_size: int,
+        sample_size: int,
+        total_samples: int,
         seed: int,
         batch_size: int,
-        total_samples: Optional[int] = None,
         **hf_kwargs,
     ):
         from coreset.dataset import HFStreamingDataset
 
-        self.batch_size = batch_size
-        self.total_samples = total_samples  # None → unlimited
+        self.batch_size    = batch_size
+        self.total_samples = total_samples
 
         self._ds = HFStreamingDataset(
             dataset_name=dataset_name,
             split=split,
             image_col=image_col,
-            shuffle_buffer=shuffle_buffer,
+            page_size=page_size,
+            sample_size=sample_size,
+            total_samples=total_samples,
             seed=seed,
             **hf_kwargs,
         )
@@ -71,70 +61,115 @@ class WorkDispatcher:
         self._images_issued: int = 0
         self._batches_issued: int = 0
         self._exhausted: bool = False
+        self._queue: List[dict] = []
+
+        # Lock guards ONLY queue/flag reads+writes, never I/O
+        self._lock = threading.Lock()
+
+        # Pre-fill synchronously before bg thread starts
+        print("[WorkDispatcher] Pre-filling batch queue ...")
+        for _ in range(8):
+            batch = self._do_fetch()
+            if batch is None:
+                break
+            self._queue.append(batch)
+        print(f"[WorkDispatcher] Queue ready with {len(self._queue)} batches")
+
+        # Background thread keeps queue topped up
+        self._bg = threading.Thread(target=self._background_fill, daemon=True)
+        self._bg.start()
+        print("[WorkDispatcher] Background fill thread started")
+
+    # ── Internal ──────────────────────────────────────────────────────────────
+
+    def _do_fetch(self) -> Optional[dict]:
+        """
+        Does the actual HF I/O. NOT thread-safe on _exhausted/_images_issued —
+        only call this from the bg thread (after the pre-fill phase).
+        """
+        images, ids = self._ds.next_chunk(self.batch_size)
+
+        if not images:
+            return None
+
+        self._images_issued += len(images)
+        self._batches_issued += 1
+        return {"images": images, "ids": ids}
+
+    def _background_fill(self) -> None:
+        """
+        Runs in a daemon thread. Fetches batches from HF and appends to queue.
+        Lock is held ONLY for the brief queue append — never during I/O.
+        """
+        while True:
+            # Check queue depth without holding lock for I/O
+            with self._lock:
+                if self._exhausted:
+                    break
+                queue_len = len(self._queue)
+
+            if queue_len >= MAX_QUEUE:
+                time.sleep(0.05)
+                continue
+
+            # Do the slow HF fetch WITHOUT holding the lock
+            batch = self._do_fetch()
+
+            if batch is None:
+                with self._lock:
+                    self._exhausted = True
+                break
+
+            # Only hold lock for the brief append
+            with self._lock:
+                self._queue.append(batch)
 
     # ── Worker-facing API ─────────────────────────────────────────────────────
 
     def get_batch(self) -> Optional[dict]:
         """
-        Pull the next batch from the HF stream.
-
-        Returns:
-            {"images": List[Optional[PIL.Image]], "ids": List[int]}
-            None when the stream is exhausted or total_samples reached.
-
-        Ray serializes the dict through the object store automatically;
-        workers receive plain Python objects with no ray.get() needed.
+        Always returns instantly — just pops from the pre-filled queue.
+        If queue is temporarily empty, spins briefly waiting for bg thread.
         """
-        if self._exhausted:
-            return None
+        for _ in range(40):   # wait up to 4 seconds total
+            with self._lock:
+                if self._queue:
+                    batch = self._queue.pop(0)
+                    print(
+                        f"[Dispatcher] batch #{self._batches_issued}  |  "
+                        f"pages covered: {self._ds._pages_issued}/{self._ds._n_pages}  |  "
+                        f"images issued so far: {self._images_issued:,}  |  "
+                        f"queue depth: {len(self._queue)}"
+                    )
+                    return batch
+                if self._exhausted:
+                    return None
+            time.sleep(0.1)
 
-        # How many images are we allowed to fetch this round?
-        remaining_budget = (
-            self.total_samples - self._images_issued
-            if self.total_samples is not None
-            else self.batch_size
-        )
-        if remaining_budget <= 0:
-            self._exhausted = True
-            return None
-
-        fetch_size = min(self.batch_size, remaining_budget)
-        images, ids = self._ds.next_chunk(fetch_size)
-
-        if not images:
-            self._exhausted = True
-            return None
-
-        self._images_issued += len(images)
-        self._batches_issued += 1
-
-        if self.total_samples is not None and self._images_issued >= self.total_samples:
-            self._exhausted = True
-
-        return {
-            "images": images,
-            "ids": ids,
-        }
+        # Timed out — treat as exhausted
+        print("[Dispatcher] get_batch timed out waiting for queue")
+        return None
 
     # ── Driver-facing API ─────────────────────────────────────────────────────
 
     def progress(self) -> dict:
-        if self.total_samples:
-            pct = 100.0 * self._images_issued / self.total_samples
-        else:
-            pct = float("nan")
+        with self._lock:
+            images_issued  = self._images_issued
+            batches_issued = self._batches_issued
+            exhausted      = self._exhausted
+            queue_len      = len(self._queue)
+
+        pct = round(100.0 * images_issued / self.total_samples, 2)
         return {
-            "images_issued": self._images_issued,
-            "total_samples": self.total_samples,
-            "pct": round(pct, 2),
-            "batches_issued": self._batches_issued,
-            "exhausted": self._exhausted,
-            "remaining": (
-                max(0, self.total_samples - self._images_issued)
-                if self.total_samples
-                else None
-            ),
+            "images_issued":  images_issued,
+            "total_samples":  self.total_samples,
+            "pct":            pct,
+            "batches_issued": batches_issued,
+            "exhausted":      exhausted,
+            "remaining":      max(0, self.total_samples - images_issued),
+            "queue_depth":    queue_len,
         }
 
     def is_exhausted(self) -> bool:
-        return self._exhausted
+        with self._lock:
+            return self._exhausted
