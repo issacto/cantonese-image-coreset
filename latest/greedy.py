@@ -1,4 +1,3 @@
-%%writefile greedy.py
 """
 Greedy coreset selection.
 

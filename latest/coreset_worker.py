@@ -108,17 +108,10 @@ class CoresetWorker:
 
     # ── Embedding ─────────────────────────────────────────────────────────────
 
-    def _embed(self, image_bytes_list: List[Optional[bytes]]) -> Tuple[np.ndarray, List[int]]:
-        """
-        Embed a list of PNG byte blobs with CLIP.
-        Returns (embeddings, valid_indices) where valid_indices maps back
-        to positions in image_bytes_list that were successfully decoded.
-        """
+    def _embed(self, image_bytes_list):
         from PIL import Image
 
-        pil_images = []
-        valid_indices = []
-
+        pil_images, valid_indices = [], []
         for i, img_bytes in enumerate(image_bytes_list):
             if img_bytes is None:
                 self._images_skipped += 1
@@ -136,17 +129,16 @@ class CoresetWorker:
         all_embs = []
         for i in range(0, len(pil_images), self.embed_batch_size):
             batch = pil_images[i: i + self.embed_batch_size]
-            print(f"[Worker {self.worker_id}] embedding {len(batch)} images ...")
             with torch.no_grad():
                 inputs = self._processor(images=batch, return_tensors="pt", padding=True)
                 inputs = {k: v.to(self._device) for k, v in inputs.items()}
-                feats = self._model.get_image_features(**inputs)
-                feats = feats / feats.norm(dim=-1, keepdim=True)  # L2 normalize
+                # ✅ Same pattern as your working ClipWorker
+                out = self._model.vision_model(pixel_values=inputs["pixel_values"])
+                feats = self._model.visual_projection(out.pooler_output)
+                feats = feats / feats.norm(dim=-1, keepdim=True)
                 all_embs.append(feats.cpu().numpy())
-            print(f"[Worker {self.worker_id}] embed done, got {len(batch)} embeddings")
 
         return np.concatenate(all_embs, axis=0), valid_indices
-
     # ── Greedy k-center ───────────────────────────────────────────────────────
 
     def _greedy_kcenter(

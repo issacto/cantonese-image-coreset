@@ -75,6 +75,7 @@ class HFStreamingDataset:
 
         ds = load_dataset(
             dataset_name,
+            "images",
             split=split,
             streaming=True,
             **hf_kwargs,

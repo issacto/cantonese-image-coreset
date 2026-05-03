@@ -333,12 +333,15 @@ def main() -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     np.save(out_dir / "coreset_indices.npy",    final_ids)
     np.save(out_dir / "coreset_embeddings.npy", final_embeddings)
+    
 
     print(f"\n[Saved]")
     print(f"  {out_dir / 'coreset_indices.npy'}    — shape {final_ids.shape}")
     print(f"  {out_dir / 'coreset_embeddings.npy'} — shape {final_embeddings.shape}")
     print(f"\nTotal wall time: {time.time() - t_start:.1f}s")
     ray.shutdown()
+
+    
 
 
 if __name__ == "__main__":
