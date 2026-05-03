@@ -6,6 +6,7 @@ Usage example:
         --hf-dataset HuggingFaceM4/Docmatix \
         --hf-split train \
         --hf-image-col images \
+        --hf-text-col texts \
         --total-samples 100000 \
         --page-size 2000 \
         --sample-size 256 \
@@ -15,7 +16,11 @@ Usage example:
         --workers 4 \
         --model openai/clip-vit-base-patch32 \
         --output ./coreset_output \
-        --seed 42
+        --seed 42 \
+        --push-to-hub your-org/docmatix-coreset \
+        --translate-model Qwen/Qwen3-4B \
+        --tp-size 2 \
+        --max-num-seqs 256
 
 Architecture
 ────────────
@@ -32,6 +37,10 @@ No dispatcher. Each worker owns one shard and runs the full pipeline:
                                                     global greedy k-center
                                                               ↓
                                                     final coreset saved to disk
+                                                              ↓
+                                              (optional) translate texts → Cantonese
+                                                              ↓
+                                               push images + translated texts to Hub
 
 Stopping logic
 ──────────────
@@ -45,7 +54,7 @@ Stopping logic
 import argparse
 import time
 from pathlib import Path
-from typing import List
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 import ray
@@ -63,7 +72,10 @@ def parse_args() -> argparse.Namespace:
     data = p.add_argument_group("Dataset (HuggingFace)")
     data.add_argument("--hf-dataset",   type=str, required=True)
     data.add_argument("--hf-split",     type=str, default="train")
-    data.add_argument("--hf-image-col", type=str, default="image")
+    data.add_argument("--hf-image-col", type=str, default="images",
+                      help="Dataset column containing a list of images per example.")
+    data.add_argument("--hf-text-col",  type=str, default="texts",
+                      help="Dataset column containing conversation turns per example.")
     data.add_argument("--hf-name",      type=str, default=None,
                       help="Optional HF dataset config name.")
     data.add_argument("--hf-token",     type=str, default=None,
@@ -109,6 +121,49 @@ def parse_args() -> argparse.Namespace:
     out = p.add_argument_group("Output")
     out.add_argument("--output", type=str, default="coreset_output")
     out.add_argument("--seed",   type=int, default=42)
+
+    # ── Hub push + translation ────────────────────────────────────────────────
+    hub = p.add_argument_group("Hub push & Cantonese translation")
+    hub.add_argument(
+        "--push-to-hub", type=str, default=None,
+        help="HuggingFace Hub repo id to push the coreset dataset to, e.g. "
+             "'your-org/docmatix-coreset'. Leave empty to skip.",
+    )
+    hub.add_argument(
+        "--translate-model", type=str, default="Qwen/Qwen3-4B",
+        help="vLLM model used for Cantonese translation (only used when --push-to-hub is set).",
+    )
+    hub.add_argument(
+        "--tp-size", type=int, default=1,
+        help=(
+            "Tensor-parallel size — GPUs per model replica. "
+            "dp_size is derived automatically as total_gpus // tp_size. "
+            "E.g. with 4 GPUs and --tp-size 2 you get TP=2, DP=2."
+        ),
+    )
+    hub.add_argument(
+        "--max-num-seqs", type=int, default=256,
+        help=(
+            "vLLM internal batch size — prompts per forward pass per replica. "
+            "Raise for A100/H100 (e.g. 512), lower for T4 if OOM (e.g. 128)."
+        ),
+    )
+    hub.add_argument(
+        "--hub-token", type=str, default=None,
+        help="HF token with write access. Falls back to HF_TOKEN env var.",
+    )
+    hub.add_argument(
+        "--hub-private", action="store_true",
+        help="Create the Hub dataset repo as private.",
+    )
+    hub.add_argument(
+        "--push-batch-size", type=int, default=500,
+        help=(
+            "Number of coreset rows to download, translate, and upload per iteration. "
+            "Each batch becomes one parquet shard on the Hub. "
+            "Lower values use less RAM; higher values reduce Hub round-trips."
+        ),
+    )
 
     return p.parse_args()
 
@@ -204,6 +259,166 @@ def global_merge(
     return pool_embs[sel], pool_ids[sel]
 
 
+# ── Hub push ──────────────────────────────────────────────────────────────────
+
+def push_coreset_to_hub(
+    final_ids: np.ndarray,
+    final_embeddings: np.ndarray,
+    args: argparse.Namespace,
+    n_gpus: int = 1,
+) -> None:
+    """
+    Stream the coreset to the Hub in fixed-size batches so RAM stays bounded
+    regardless of how large ``final_ids`` is.
+
+    tp_size and dp_size are derived from n_gpus and args.tp_size:
+        tp_size = args.tp_size
+        dp_size = n_gpus // tp_size   (e.g. 4 GPUs, tp=2 → dp=2)
+    
+        1. Selects the rows from the source HF dataset (download images + texts).
+        2. Translates every ``user`` / ``assistant`` turn to Cantonese with vLLM.
+        3. Serialises the batch to a numbered parquet shard and uploads it to Hub.
+
+    The Hub dataset ends up with columns:
+        ``images``           List[PIL.Image]  — page images for the document
+        ``texts``            List[Dict]        — Cantonese-translated conversations
+                                                 {"user": ..., "assistant": ..., "source": ...}
+        ``texts_en``         List[Dict]        — original English conversations
+                                                 {"user": ..., "assistant": ..., "source": ...}
+        ``coreset_embedding`` List[float]      — CLIP embedding used for k-center selection
+        ``coreset_index``     int              — row index in the original source dataset
+    """
+    import tempfile
+
+    import datasets
+    from datasets import Dataset, Image as HFImage
+    from huggingface_hub import HfApi
+
+    from coreset.translate import CantoneseTranslator
+
+    indices: List[int]  = final_ids.tolist()           # plain Python ints for HF .select()
+    embeddings: List    = final_embeddings.tolist()     # List[List[float]]
+    n_total             = len(indices)
+    batch_sz            = args.push_batch_size
+    n_batches           = (n_total + batch_sz - 1) // batch_sz
+
+    # ── Load source dataset (streaming=False so .select() works) ─────────────
+    print(f"\n[Hub] Loading source dataset '{args.hf_dataset}' (split={args.hf_split}) ...")
+    load_kwargs: Dict[str, Any] = {}
+    if args.hf_name:
+        load_kwargs["name"] = args.hf_name
+    if args.hf_token:
+        load_kwargs["token"] = args.hf_token
+
+    full_ds = datasets.load_dataset(
+        args.hf_dataset,
+        split=args.hf_split,
+        **load_kwargs,
+    )
+
+    # Derive TP / DP from cluster GPU count and user-specified tp_size
+    tp_size = args.tp_size
+    dp_size = max(1, n_gpus // tp_size)
+
+    # ── Load translation model once — reused across all batches ──────────────
+    print(
+        f"[Hub] Loading translation model '{args.translate_model}'  "
+        f"TP={tp_size}  DP={dp_size}  (total GPUs={n_gpus}) ..."
+    )
+    translator = CantoneseTranslator(
+        model=args.translate_model,
+        tensor_parallel_size=tp_size,
+        data_parallel_size=dp_size,
+    )
+
+    # ── Create Hub repo once so all shard uploads land in the same place ──────
+    token = args.hub_token or None
+    api   = HfApi(token=token)
+    api.create_repo(
+        repo_id=args.push_to_hub,
+        repo_type="dataset",
+        private=args.hub_private,
+        exist_ok=True,
+    )
+    print(f"[Hub] Repo ready → https://huggingface.co/datasets/{args.push_to_hub}")
+
+    # ── Batch loop ────────────────────────────────────────────────────────────
+    t_push_total = time.time()
+
+    for batch_idx in range(n_batches):
+        lo = batch_idx * batch_sz
+        hi = min(lo + batch_sz, n_total)
+
+        batch_indices:    List[int]         = indices[lo:hi]
+        batch_embeddings: List[List[float]] = embeddings[lo:hi]
+
+        print(
+            f"\n[Hub] Batch {batch_idx + 1}/{n_batches}  "
+            f"rows {lo:,}–{hi - 1:,}  ({hi - lo} examples)"
+        )
+
+        # 1. Download this slice of the dataset ───────────────────────────────
+        t0 = time.time()
+        batch_ds = full_ds.select(batch_indices)
+
+        raw_images: List[Any]        = batch_ds[args.hf_image_col]  # List[List[PIL.Image]]
+        raw_texts:  List[List[Dict]] = batch_ds[args.hf_text_col]   # List[List[Dict]]
+        print(f"  Downloaded in {time.time() - t0:.1f}s")
+
+        # 2. Translate user / assistant turns to Cantonese ────────────────────
+        t0 = time.time()
+        texts_yue: List[List[Dict]] = translator.translate_conversations(
+            all_conversations=raw_texts,
+            max_num_seqs=args.max_num_seqs,
+        )
+        print(f"  Translated in {time.time() - t0:.1f}s")
+
+        # 3. Build Dataset for this batch ─────────────────────────────────────
+        records = {
+            args.hf_image_col:      raw_images,         # List[List[PIL.Image]]
+            args.hf_text_col:       texts_yue,           # List[List[Dict]]  — Cantonese
+            f"{args.hf_text_col}_en": raw_texts,         # List[List[Dict]]  — English
+            "coreset_embedding":    batch_embeddings,    # List[List[float]]
+            "coreset_index":        batch_indices,       # List[int]
+        }
+
+        batch_hf = Dataset.from_dict(records)
+
+        # Cast image column so Hub viewer renders thumbnails
+        try:
+            batch_hf = batch_hf.cast_column(
+                args.hf_image_col,
+                datasets.Sequence(HFImage()),
+            )
+        except Exception as cast_err:
+            print(f"  [Warn] Image cast failed ({cast_err!r}); uploading as-is.")
+
+        # 4. Serialise to a temp parquet file and upload as a named shard ─────
+        t0 = time.time()
+        shard_name = (
+            f"data/train-{batch_idx:05d}-of-{n_batches:05d}.parquet"
+        )
+        with tempfile.NamedTemporaryFile(suffix=".parquet", delete=True) as tmp:
+            batch_hf.to_parquet(tmp.name)
+            api.upload_file(
+                path_or_fileobj=tmp.name,
+                path_in_repo=shard_name,
+                repo_id=args.push_to_hub,
+                repo_type="dataset",
+                token=token,
+            )
+        print(f"  Uploaded shard '{shard_name}' in {time.time() - t0:.1f}s")
+
+    # Release translator actors + placement group now that all batches are done
+    translator.shutdown()
+
+    print(
+        f"\n[Hub] All {n_batches} shards uploaded in "
+        f"{time.time() - t_push_total:.1f}s total  →  "
+        f"https://huggingface.co/datasets/{args.push_to_hub}"
+    )
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main() -> None:
@@ -221,6 +436,7 @@ def main() -> None:
     print("=" * 64)
     print(f"  HF dataset        : {args.hf_dataset}  (split={args.hf_split})")
     print(f"  Image column      : {args.hf_image_col}")
+    print(f"  Text column       : {args.hf_text_col}")
     print(f"  Workers           : {args.workers}  (one shard each)")
     print(f"  Total samples     : {args.total_samples:,}  (all workers combined)")
     print(f"  Samples/worker    : {samples_per_worker:,}")
@@ -236,6 +452,12 @@ def main() -> None:
     print(f"  GPUs/worker       : {args.gpus_per_worker}")
     print(f"  Output            : {args.output}")
     print(f"  Seed              : {args.seed}")
+    if args.push_to_hub:
+        print(f"  Push to Hub       : {args.push_to_hub}")
+        print(f"  Translate model   : {args.translate_model}")
+        print(f"  TP size           : {args.tp_size}  (GPUs per replica)")
+        print(f"  max_num_seqs      : {args.max_num_seqs}  (vLLM internal batch)")
+        print(f"  Push batch size   : {args.push_batch_size:,}  (rows per shard)")
     print("=" * 64)
 
     # ── Ray init ──────────────────────────────────────────────────────────────
@@ -328,20 +550,42 @@ def main() -> None:
         f"Final coreset: {len(final_ids):,} points."
     )
 
+    t0 = time.time()
+    sort_order = np.argsort(final_ids)
+    final_ids = final_ids[sort_order]
+    final_embeddings = final_embeddings[sort_order]
+    print(f"[Sort] Sorted {len(final_ids):,} coreset indices in {time.time() - t0:.3f}s")
+
+    
+
+    # ── Kill worker actors to free their GPU allocations ──────────────────────
+    # ray.shutdown() would also kill the Ray cluster that vLLM needs for tensor
+    # parallelism. Instead we kill only the CoresetWorker actors so their GPU
+    # memory is released, while the cluster itself stays up.
+    print("\n[Ray] Killing CoresetWorker actors to release GPU memory ...")
+    for w in workers:
+        ray.kill(w)
+    print("[Ray] Workers killed.")
+
     # ── Save ──────────────────────────────────────────────────────────────────
     out_dir = Path(args.output)
     out_dir.mkdir(parents=True, exist_ok=True)
     np.save(out_dir / "coreset_indices.npy",    final_ids)
     np.save(out_dir / "coreset_embeddings.npy", final_embeddings)
-    
 
     print(f"\n[Saved]")
     print(f"  {out_dir / 'coreset_indices.npy'}    — shape {final_ids.shape}")
     print(f"  {out_dir / 'coreset_embeddings.npy'} — shape {final_embeddings.shape}")
-    print(f"\nTotal wall time: {time.time() - t_start:.1f}s")
+
+    # ── Optional: push to Hub with Cantonese translation ──────────────────────
+    # vLLM spawns its own Ray actors for tensor parallelism, so Ray must still
+    # be running at this point. We shut it down only after translation is done.
+    if args.push_to_hub:
+        push_coreset_to_hub(final_ids, final_embeddings, args, n_gpus=int(total_gpu_capacity))
+
     ray.shutdown()
 
-    
+    print(f"\nTotal wall time: {time.time() - t_start:.1f}s")
 
 
 if __name__ == "__main__":
