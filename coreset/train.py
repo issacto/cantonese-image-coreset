@@ -8,7 +8,7 @@ Usage example:
         --hf-image-col images \
         --hf-text-col texts \
         --total-samples 100000 \
-        --page-size 2000 \
+        --page-size 1000 \
         --sample-size 256 \
         --final-coreset-size 10000 \
         --local-coreset-size 1000 \
@@ -37,6 +37,8 @@ No dispatcher. Each worker owns one shard and runs the full pipeline:
                                                     global greedy k-center
                                                               ↓
                                                     final coreset saved to disk
+                                                              ↓
+                                              (optional) evaluate embedding diversity
                                                               ↓
                                               (optional) translate texts → Cantonese
                                                               ↓
@@ -259,6 +261,51 @@ def global_merge(
     return pool_embs[sel], pool_ids[sel]
 
 
+# ── Embedding evaluation ──────────────────────────────────────────────────────
+
+def evaluate_embeddings(embeddings: np.ndarray, output_dir: Path) -> None:
+    """
+    Compute pairwise cosine similarity statistics over the final coreset
+    embeddings and save a histogram of the distribution.
+
+    Args:
+        embeddings:  Array of shape (n, d) — the final coreset embeddings.
+        output_dir:  Directory where the histogram PNG will be saved.
+    """
+    from sklearn.metrics.pairwise import cosine_similarity
+    import matplotlib.pyplot as plt
+
+    print(f"\n[Eval] Computing pairwise cosine similarities for {len(embeddings):,} embeddings ...")
+    t0 = time.time()
+
+    sim_matrix = cosine_similarity(embeddings)
+
+    # Exclude diagonal (self-similarity = 1.0)
+    mask = ~np.eye(sim_matrix.shape[0], dtype=bool)
+    pairwise_sims = sim_matrix[mask]
+
+    print(f"[Eval] Done in {time.time() - t0:.1f}s")
+    print(f"  Count            : {len(pairwise_sims):,}")
+    print(f"  Mean similarity  : {pairwise_sims.mean():.4f}")
+    print(f"  Median similarity: {np.median(pairwise_sims):.4f}")
+    print(f"  Std similarity   : {pairwise_sims.std():.4f}")
+    print(f"  Min similarity   : {pairwise_sims.min():.4f}")
+    print(f"  Max similarity   : {pairwise_sims.max():.4f}")
+
+    fig, ax = plt.subplots(figsize=(8, 5))
+    ax.hist(pairwise_sims, bins=50, edgecolor="black")
+    ax.set_xlabel("Cosine Similarity")
+    ax.set_ylabel("Count")
+    ax.set_title("Pairwise Similarity Distribution of Coreset Embeddings")
+    fig.tight_layout()
+
+    hist_path = output_dir / "coreset_similarity_histogram.png"
+    fig.savefig(hist_path, dpi=150)
+    plt.show()
+    plt.close(fig)
+    print(f"[Eval] Histogram saved → {hist_path}")
+
+
 # ── Hub push ──────────────────────────────────────────────────────────────────
 
 def push_coreset_to_hub(
@@ -274,7 +321,7 @@ def push_coreset_to_hub(
     tp_size and dp_size are derived from n_gpus and args.tp_size:
         tp_size = args.tp_size
         dp_size = n_gpus // tp_size   (e.g. 4 GPUs, tp=2 → dp=2)
-    
+
         1. Selects the rows from the source HF dataset (download images + texts).
         2. Translates every ``user`` / ``assistant`` turn to Cantonese with vLLM.
         3. Serialises the batch to a numbered parquet shard and uploads it to Hub.
@@ -285,8 +332,6 @@ def push_coreset_to_hub(
                                                  {"user": ..., "assistant": ..., "source": ...}
         ``texts_en``         List[Dict]        — original English conversations
                                                  {"user": ..., "assistant": ..., "source": ...}
-        ``coreset_embedding`` List[float]      — CLIP embedding used for k-center selection
-        ``coreset_index``     int              — row index in the original source dataset
     """
     import tempfile
 
@@ -297,24 +342,36 @@ def push_coreset_to_hub(
     from coreset.translate import CantoneseTranslator
 
     indices: List[int]  = final_ids.tolist()           # plain Python ints for HF .select()
-    embeddings: List    = final_embeddings.tolist()     # List[List[float]]
     n_total             = len(indices)
     batch_sz            = args.push_batch_size
     n_batches           = (n_total + batch_sz - 1) // batch_sz
 
-    # ── Load source dataset (streaming=False so .select() works) ─────────────
+    # ── Load source dataset (streaming=True for memory efficiency) ────────────
     print(f"\n[Hub] Loading source dataset '{args.hf_dataset}' (split={args.hf_split}) ...")
-    load_kwargs: Dict[str, Any] = {}
+    load_kwargs: Dict[str, Any] = dict(streaming=True)
     if args.hf_name:
         load_kwargs["name"] = args.hf_name
     if args.hf_token:
         load_kwargs["token"] = args.hf_token
 
-    full_ds = datasets.load_dataset(
+    ds_stream = datasets.load_dataset(
         args.hf_dataset,
+        "images",
         split=args.hf_split,
         **load_kwargs,
     )
+
+    target_set = set(indices)
+    collected: Dict[int, Any] = {}
+    print(f"[Hub] Streaming to collect {len(indices):,} coreset rows ...")
+    t0 = time.time()
+    for stream_idx, row in enumerate(ds_stream):
+        if stream_idx in target_set:
+            collected[stream_idx] = row
+            if len(collected) == len(indices):
+                break
+    print(f"[Hub] Collected {len(collected):,} rows in {time.time() - t0:.1f}s")
+    ordered_rows = [collected[i] for i in indices]
 
     # Derive TP / DP from cluster GPU count and user-specified tp_size
     tp_size = args.tp_size
@@ -349,8 +406,7 @@ def push_coreset_to_hub(
         lo = batch_idx * batch_sz
         hi = min(lo + batch_sz, n_total)
 
-        batch_indices:    List[int]         = indices[lo:hi]
-        batch_embeddings: List[List[float]] = embeddings[lo:hi]
+        batch_indices: List[int] = indices[lo:hi]
 
         print(
             f"\n[Hub] Batch {batch_idx + 1}/{n_batches}  "
@@ -359,10 +415,9 @@ def push_coreset_to_hub(
 
         # 1. Download this slice of the dataset ───────────────────────────────
         t0 = time.time()
-        batch_ds = full_ds.select(batch_indices)
-
-        raw_images: List[Any]        = batch_ds[args.hf_image_col]  # List[List[PIL.Image]]
-        raw_texts:  List[List[Dict]] = batch_ds[args.hf_text_col]   # List[List[Dict]]
+        batch_rows = ordered_rows[lo:hi]
+        raw_images: List[Any]        = [r[args.hf_image_col] for r in batch_rows]
+        raw_texts:  List[List[Dict]] = [r[args.hf_text_col]  for r in batch_rows]
         print(f"  Downloaded in {time.time() - t0:.1f}s")
 
         # 2. Translate user / assistant turns to Cantonese ────────────────────
@@ -375,11 +430,9 @@ def push_coreset_to_hub(
 
         # 3. Build Dataset for this batch ─────────────────────────────────────
         records = {
-            args.hf_image_col:      raw_images,         # List[List[PIL.Image]]
-            args.hf_text_col:       texts_yue,           # List[List[Dict]]  — Cantonese
-            f"{args.hf_text_col}_en": raw_texts,         # List[List[Dict]]  — English
-            "coreset_embedding":    batch_embeddings,    # List[List[float]]
-            "coreset_index":        batch_indices,       # List[int]
+            args.hf_image_col:        raw_images,   # List[List[PIL.Image]]
+            args.hf_text_col:         texts_yue,    # List[List[Dict]]  — Cantonese
+            f"{args.hf_text_col}_en": raw_texts,    # List[List[Dict]]  — English
         }
 
         batch_hf = Dataset.from_dict(records)
@@ -556,8 +609,6 @@ def main() -> None:
     final_embeddings = final_embeddings[sort_order]
     print(f"[Sort] Sorted {len(final_ids):,} coreset indices in {time.time() - t0:.3f}s")
 
-    
-
     # ── Kill worker actors to free their GPU allocations ──────────────────────
     # ray.shutdown() would also kill the Ray cluster that vLLM needs for tensor
     # parallelism. Instead we kill only the CoresetWorker actors so their GPU
@@ -576,6 +627,9 @@ def main() -> None:
     print(f"\n[Saved]")
     print(f"  {out_dir / 'coreset_indices.npy'}    — shape {final_ids.shape}")
     print(f"  {out_dir / 'coreset_embeddings.npy'} — shape {final_embeddings.shape}")
+
+    # ── Evaluate coreset diversity ────────────────────────────────────────────
+    evaluate_embeddings(final_embeddings, out_dir)
 
     # ── Optional: push to Hub with Cantonese translation ──────────────────────
     # vLLM spawns its own Ray actors for tensor parallelism, so Ray must still
