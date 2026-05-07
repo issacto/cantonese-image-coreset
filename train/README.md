@@ -1,0 +1,19 @@
+python -m train.train_ray_lora \
+    --clip_model       openai/clip-vit-large-patch14 \
+    --llm_model        ibm-granite/granite-4.1-3b \
+    --dataset          HuggingFaceM4/Docmatix \
+    --dataset_config   images \
+    --dataset_split    train \
+    --image_col        images \
+    --text_col         texts \
+    --text_subfield    assistant \
+    --train_samples    127000 \
+    --streaming \
+    --val_dataset      HuggingFaceM4/FineVisionMax \
+    --val_split        train \
+    --val_samples      1000 \
+    --lora_targets     q_proj k_proj v_proj o_proj gate_proj up_proj down_proj \
+    --dtype            bf16 \
+    --gpus_per_worker  0.5 \
+    --cpus_per_worker  5 \
+    --num_workers 2

@@ -514,6 +514,7 @@ def main() -> None:
     print("=" * 64)
 
     # ── Ray init ──────────────────────────────────────────────────────────────
+    t_total_start = time.time()
     ray.init(address="auto")
     print(f"[Ray] Cluster resources: {ray.cluster_resources()}")
 
@@ -539,6 +540,7 @@ def main() -> None:
 
     # ── Spawn workers ─────────────────────────────────────────────────────────
     print(f"\n[1/2] Spawning {args.workers} workers ...")
+    t0 = time.time()  
     from coreset.CoresetWorker import CoresetWorker
     from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 
@@ -569,6 +571,8 @@ def main() -> None:
         )
         workers.append(worker)
         print(f"  Worker {i} → shard {i}/{args.workers} on {node['NodeManagerAddress']}")
+    
+    print(f"[Timing] Worker spawn: {time.time() - t0:.1f}s")
 
     # ── Run all workers in parallel ───────────────────────────────────────────
     print(f"\n[2/2] Running all workers in parallel ...")
@@ -619,27 +623,33 @@ def main() -> None:
     print("[Ray] Workers killed.")
 
     # ── Save ──────────────────────────────────────────────────────────────────
+    t0 = time.time()
     out_dir = Path(args.output)
     out_dir.mkdir(parents=True, exist_ok=True)
     np.save(out_dir / "coreset_indices.npy",    final_ids)
     np.save(out_dir / "coreset_embeddings.npy", final_embeddings)
+    print(f"[Timing] Save to disk: {time.time() - t0:.3f}s")
 
     print(f"\n[Saved]")
     print(f"  {out_dir / 'coreset_indices.npy'}    — shape {final_ids.shape}")
     print(f"  {out_dir / 'coreset_embeddings.npy'} — shape {final_embeddings.shape}")
 
     # ── Evaluate coreset diversity ────────────────────────────────────────────
+    t0 = time.time()
     evaluate_embeddings(final_embeddings, out_dir)
+    print(f"[Timing] Embedding evaluation: {time.time() - t0:.1f}s") 
 
     # ── Optional: push to Hub with Cantonese translation ──────────────────────
     # vLLM spawns its own Ray actors for tensor parallelism, so Ray must still
     # be running at this point. We shut it down only after translation is done.
     if args.push_to_hub:
+        t0 = time.time() 
         push_coreset_to_hub(final_ids, final_embeddings, args, n_gpus=int(total_gpu_capacity))
+        print(f"[Timing] Hub push + translation: {time.time() - t0:.1f}s")
 
     ray.shutdown()
 
-    print(f"\nTotal wall time: {time.time() - t_start:.1f}s")
+    print(f"\nTotal wall time: {time.time() - t_total_start:.1f}s")
 
 
 if __name__ == "__main__":
