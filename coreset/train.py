@@ -60,6 +60,7 @@ from typing import Any, Dict, List, Optional
 
 import numpy as np
 import ray
+import os
 
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
@@ -515,7 +516,15 @@ def main() -> None:
 
     # ── Ray init ──────────────────────────────────────────────────────────────
     t_total_start = time.time()
-    ray.init(address="auto")
+    hf_token = args.hf_token or os.environ.get("HF_TOKEN")
+    ray.init(
+        address="auto",
+        runtime_env={
+            "env_vars": {
+                "HF_TOKEN": hf_token or "",
+            }
+        } if hf_token else {},
+    )
     print(f"[Ray] Cluster resources: {ray.cluster_resources()}")
 
     # ── GPU nodes ─────────────────────────────────────────────────────────────

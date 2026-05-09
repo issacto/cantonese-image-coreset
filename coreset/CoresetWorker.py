@@ -17,7 +17,8 @@ from typing import List, Optional, Tuple
 import numpy as np
 import ray
 import torch
-
+import os
+from huggingface_hub import login
 
 @ray.remote
 class CoresetWorker:
@@ -56,8 +57,13 @@ class CoresetWorker:
         model_name: str,
         embed_batch_size: int,
         seed: int,
+        token=None,
         **hf_kwargs,
     ):
+        hf_token = token or os.environ.get("HF_TOKEN")
+        if hf_token:
+            login(token=hf_token, add_to_git_credential=False)
+
         from coreset.dataset import HFStreamingDataset
 
         self.worker_id       = worker_id
