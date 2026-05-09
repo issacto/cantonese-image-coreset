@@ -8,8 +8,6 @@ from transformers import CLIPModel
 
 
 class VisionProjection(nn.Module):
-    """Two-layer GELU MLP: CLIP pooled dim → LLM hidden dim."""
-
     def __init__(self, clip_dim: int, llm_dim: int):
         super().__init__()
         self.net = nn.Sequential(
@@ -17,9 +15,10 @@ class VisionProjection(nn.Module):
             nn.GELU(),
             nn.Linear(llm_dim, llm_dim),
         )
+        self.norm = nn.LayerNorm(llm_dim)  # ← add this
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.net(x)
+    def forward(self, x):
+        return self.norm(self.net(x)) 
 
 
 # ─── Dim auto-detection ───────────────────────────────────────────────────────
