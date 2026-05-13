@@ -116,10 +116,10 @@ This ensures diversity both:
 
 ### Infrastructure
 
-* 2 TPU nodes
-* 16 CPU cores per TPU
+* 2 T4 GPU nodes
+* 16 CPU cores per GPU
 * 8 distributed workers
-* 3 CPU cores allocated per worker
+* 3 CPU, 0.25 GPU cores allocated per worker, 
 
 ---
 
