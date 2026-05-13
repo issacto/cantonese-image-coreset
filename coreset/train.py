@@ -550,7 +550,7 @@ def main() -> None:
     # ── Spawn workers ─────────────────────────────────────────────────────────
     print(f"\n[1/2] Spawning {args.workers} workers ...")
     t0 = time.time()  
-    from coreset.CoresetWorker import CoresetWorker
+    from coreset.worker import CoresetWorker
     from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 
     workers = []
