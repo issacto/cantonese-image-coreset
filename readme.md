@@ -10,6 +10,19 @@ This project focused on improving training efficiency and downstream benchmark p
 
 ---
 
+# Models & Dataset
+
+## Fine-Tuned Models
+
+* [Issactoto/granite-vision-3.3-2b-enhanced-coreset](https://huggingface.co/Issactoto/granite-vision-3.3-2b-enhanced-coreset)
+* [Issactoto/granite-vision-3.3-2b-enhanced-first40k](https://huggingface.co/Issactoto/granite-vision-3.3-2b-enhanced-first40k)
+
+## Coreset Dataset
+
+* [Issactoto/HuggingFaceM4-Docmatix-coreset-39k](https://huggingface.co/datasets/Issactoto/HuggingFaceM4-Docmatix-coreset-39k)
+
+---
+
 # Problem
 
 Training large multimodal models at scale is extremely resource intensive.
@@ -119,7 +132,7 @@ This ensures diversity both:
 * 2 T4 GPU nodes
 * 16 CPU cores per GPU
 * 8 distributed workers
-* 3 CPU, 0.25 GPU cores allocated per worker, 
+* 3 CPU, 0.25 GPU cores allocated per worker
 
 ---
 
